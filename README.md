@@ -4,9 +4,9 @@ A small project for learning weight quantization by implementing it and measurin
 what changes.
 
 The current milestone compares the floating-point Qwen2.5-0.5B baseline with
-per-tensor INT8 weights in its Transformer linear layers. A standalone matrix
-exercise explains the arithmetic first. There are no advanced quantization methods
-or serving frameworks in this implementation yet.
+per-tensor and per-output-channel INT8 weights in its Transformer linear layers.
+A standalone matrix exercise explains the arithmetic first. There are no advanced
+quantization methods or serving frameworks in this implementation yet.
 
 ## Setup: NVIDIA GPU through WSL/Linux
 
@@ -69,10 +69,17 @@ python -m quantization_lab demo
 python -m unittest discover -s tests -v
 ```
 
-Both commands work offline on CPU. The demo quantizes one matrix, then repeats it
-with a single large outlier. Compare the scale, weight MSE, and linear output MSE.
-It reports actual FP32 source storage and INT8 storage including its FP32 scale;
-this demo's source precision is separate from the model's BF16 baseline.
+Both commands work offline on CPU. The demo quantizes one matrix with both scale
+granularities, then repeats the comparison with a single large outlier. Compare
+weight MSE and linear output MSE. `num_scales`, `scale_min`, and `scale_max` show
+how the precision is distributed without printing every row's scale.
+
+The 64-by-128 FP32 source matrix uses 32,768 bytes. Its INT8 values use 8,192 bytes:
+per-tensor scaling adds one four-byte scale (8,196 bytes total), while per-channel
+scaling adds 64 scales (8,448 bytes total). The extra scales let unaffected rows
+keep their precision when another row contains an outlier. Weights in the outlier's
+own row still share that row's larger step size. The demo's FP32 source precision
+is separate from the model's BF16 baseline.
 
 Read [the INT8 implementation](src/quantization_lab/quantizers/int8.py) first.
 `NaiveInt8Linear` stores integer weights but reconstructs a floating-point matrix
@@ -83,13 +90,17 @@ on every call. This saves persistent storage; it is not an INT8 matrix multiply.
 ```bash
 python -m quantization_lab run --config configs/smoke.json --variant baseline
 python -m quantization_lab run --config configs/smoke.json --variant int8_per_tensor
+python -m quantization_lab run --config configs/smoke.json --variant int8_per_channel
 ```
 
-Each invocation loads the original floating-point checkpoint. The INT8 variant
+Each invocation loads the original floating-point checkpoint. Both INT8 variants
 replaces only linear layers inside Qwen's Transformer blocks. Embeddings,
 normalization layers, and the output head remain unchanged, including their weight
-sharing. Each converted weight matrix gets one FP32 scale; the forward pass
-reconstructs weights in the input dtype before calling `F.linear`.
+sharing. Per-tensor INT8 stores one FP32 scale for the whole weight matrix.
+Per-channel INT8 stores scales shaped `[out_features, 1]`, computed from the maximum
+absolute weight in each output row. Broadcasting those scales across the input
+columns reconstructs the matrix. Both variants reconstruct weights in the input
+dtype before calling `F.linear`; neither performs an integer matrix multiply.
 
 Numerical checks run during quantization. Forward passes keep only metadata and
 shape assertions, avoiding GPU synchronization from repeatedly checking scales.
@@ -97,8 +108,8 @@ The `dtype` in the environment report is the floating-point compute dtype; INT8
 weights and FP32 scales coexist with it. Smaller persistent storage does not imply
 lower peak memory or faster inference.
 
-The variant defaults to `baseline` if omitted. After both smoke runs work, repeat
-the pair with `--config configs/comparison.json` for a larger measurement sample.
+The variant defaults to `baseline` if omitted. After all three smoke runs work,
+repeat them with `--config configs/comparison.json` for a larger measurement sample.
 Keep the model revision, data, image, GPU, and workload settings identical between
 the baseline and INT8 runs.
 
@@ -191,8 +202,10 @@ summary.csv           one row per workload case
 times generation; `results.py` writes plain files. `cli.py` connects those functions
 with a straightforward loop.
 
-Seven focused tests use generated tensors and a tiny randomly initialized Qwen
-model. The conversion integration test checks preserved layers and tied weights,
-INT8 storage, and working cached decoding. Tests download no weights or data;
-their timings and perplexities are not model-quality or GPU-performance results.
+Eight focused tests use generated tensors and a tiny randomly initialized Qwen
+model. One numerical test checks known per-channel scales, rounding, and a zero
+row. The existing conversion integration test runs both granularities and checks
+preserved layers and tied weights, INT8 storage, and working cached decoding.
+Tests download no weights or data; their timings and perplexities are not
+model-quality or GPU-performance results.
 

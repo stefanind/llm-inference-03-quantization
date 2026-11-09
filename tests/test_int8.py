@@ -28,6 +28,15 @@ class Int8Tests(unittest.TestCase):
                     dequantize_int8(codes, scale), torch.tensor(expected, dtype=torch.float32)
                 )
 
+    def test_per_channel_scales_with_an_outlier_and_zero_row(self):
+        # Only the second row has a large outlier. Its scale must not affect the first row.
+        weight = torch.tensor([[1.27, 0.016, -0.016], [127.0, 1.6, -1.6], [0.0, 0.0, 0.0]])
+        codes, scale = quantize_int8(weight, per_channel=True)
+        self.assertEqual(codes.tolist(), [[127, 2, -2], [127, 2, -2], [0, 0, 0]])
+        torch.testing.assert_close(scale, torch.tensor([[0.01], [1.0], [1.0]]))
+        expected = torch.tensor([[1.27, 0.02, -0.02], [127.0, 2.0, -2.0], [0.0, 0.0, 0.0]])
+        torch.testing.assert_close(dequantize_int8(codes, scale), expected)
+
     def test_linear_matches_known_reconstructed_weights(self):
         inputs = torch.tensor([[[1.0, 2.0, 3.0], [-1.0, 0.0, 2.0]]])
         expected_weights = torch.tensor([[-127.0, 0.0, 1.0], [1.0, 3.0, 127.0]])
@@ -58,41 +67,45 @@ class Int8Tests(unittest.TestCase):
             max_position_embeddings=64, tie_word_embeddings=True,
             attn_implementation="sdpa",
         )
-        model = Qwen2ForCausalLM(config).eval()
-        embeddings = model.model.embed_tokens
-        head = model.lm_head
-        norm_weights = {
-            name: weight.detach().clone()
-            for name, weight in model.named_parameters() if "norm" in name
-        }
-        original_bytes = model_tensor_bytes(model)
+        for per_channel in (False, True):
+            with self.subTest(per_channel=per_channel):
+                model = Qwen2ForCausalLM(config).eval()
+                embeddings = model.model.embed_tokens
+                head = model.lm_head
+                norm_weights = {
+                    name: weight.detach().clone()
+                    for name, weight in model.named_parameters() if "norm" in name
+                }
+                original_bytes = model_tensor_bytes(model)
 
-        # One Qwen block has four attention projections and three MLP projections.
-        self.assertEqual(quantize_model_int8(model), 7)
-        converted = [m for m in model.model.layers.modules() if isinstance(m, NaiveInt8Linear)]
-        self.assertEqual(len(converted), 7)
-        self.assertFalse(any(isinstance(m, nn.Linear) for m in model.model.layers.modules()))
-        for layer in converted:
-            self.assertEqual(layer.qweight.dtype, torch.int8)
-            self.assertEqual(layer.scale.dtype, torch.float32)
-            self.assertFalse(layer.training)
-        self.assertIs(model.model.embed_tokens, embeddings)
-        self.assertIs(model.lm_head, head)
-        self.assertIs(model.lm_head.weight, model.model.embed_tokens.weight)
-        for name, expected in norm_weights.items():
-            torch.testing.assert_close(model.get_parameter(name), expected)
-        self.assertLess(model_tensor_bytes(model), original_bytes)
+                # One block has four attention projections and three MLP projections.
+                self.assertEqual(quantize_model_int8(model, per_channel=per_channel), 7)
+                converted = [m for m in model.model.layers.modules() if isinstance(m, NaiveInt8Linear)]
+                self.assertEqual(len(converted), 7)
+                self.assertFalse(any(isinstance(m, nn.Linear) for m in model.model.layers.modules()))
+                for layer in converted:
+                    self.assertEqual(layer.qweight.dtype, torch.int8)
+                    self.assertEqual(layer.scale.dtype, torch.float32)
+                    expected_shape = (layer.out_features, 1) if per_channel else ()
+                    self.assertEqual(layer.scale.shape, expected_shape)
+                    self.assertFalse(layer.training)
+                self.assertIs(model.model.embed_tokens, embeddings)
+                self.assertIs(model.lm_head, head)
+                self.assertIs(model.lm_head.weight, model.model.embed_tokens.weight)
+                for name, expected in norm_weights.items():
+                    torch.testing.assert_close(model.get_parameter(name), expected)
+                self.assertLess(model_tensor_bytes(model), original_bytes)
 
-        with torch.inference_mode():
-            inputs = torch.tensor([[1, 2, 3], [4, 5, 6]])
-            prefill = model(input_ids=inputs, use_cache=True)
-            token = prefill.logits[:, -1].argmax(dim=-1, keepdim=True)
-            decode = model(input_ids=token, past_key_values=prefill.past_key_values, use_cache=True)
-        self.assertEqual(prefill.logits.shape, (2, 3, 32))
-        self.assertEqual(decode.logits.shape, (2, 1, 32))
-        self.assertEqual(decode.past_key_values.get_seq_length(), 4)
-        self.assertTrue(torch.isfinite(prefill.logits).all())
-        self.assertTrue(torch.isfinite(decode.logits).all())
+                with torch.inference_mode():
+                    inputs = torch.tensor([[1, 2, 3], [4, 5, 6]])
+                    prefill = model(input_ids=inputs, use_cache=True)
+                    token = prefill.logits[:, -1].argmax(dim=-1, keepdim=True)
+                    decode = model(input_ids=token, past_key_values=prefill.past_key_values, use_cache=True)
+                self.assertEqual(prefill.logits.shape, (2, 3, 32))
+                self.assertEqual(decode.logits.shape, (2, 1, 32))
+                self.assertEqual(decode.past_key_values.get_seq_length(), 4)
+                self.assertTrue(torch.isfinite(prefill.logits).all())
+                self.assertTrue(torch.isfinite(decode.logits).all())
 
 
 if __name__ == "__main__":

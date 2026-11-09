@@ -9,10 +9,13 @@ from pathlib import Path
 import platform
 
 
+VARIANTS = ("baseline", "int8_per_tensor", "int8_per_channel")
+
+
 def validate_config(config):
     """Reject invalid user settings before downloading a model or dataset."""
-    if config.get("variant", "baseline") not in ("baseline", "int8_per_tensor"):
-        raise ValueError("variant must be baseline or int8_per_tensor.")
+    if config.get("variant", "baseline") not in VARIANTS:
+        raise ValueError(f"variant must be one of: {', '.join(VARIANTS)}.")
     evaluation = config["evaluation"]
     benchmark = config["benchmark"]
     for name in ("max_tokens", "context_length", "stride"):
@@ -63,9 +66,9 @@ def run_experiment(config, output_root):
         raise ValueError("Evaluation context length exceeds the model context limit.")
 
     converted_layers = 0
-    if variant == "int8_per_tensor":
-        converted_layers = quantize_model_int8(model)
-        print(f"Converted {converted_layers} Transformer linear layers to INT8.", flush=True)
+    if variant != "baseline":
+        converted_layers = quantize_model_int8(model, per_channel=variant == "int8_per_channel")
+        print(f"Converted {converted_layers} Transformer linear layers: {variant}.", flush=True)
 
     token_budget = max(
         evaluation["max_tokens"],
@@ -144,7 +147,7 @@ def main():
     commands.add_parser("demo", help="Run the INT8 matrix exercise offline on CPU.")
     run = commands.add_parser("run", help="Evaluate and benchmark the baseline or INT8 model.")
     run.add_argument("--config", type=Path, required=True)
-    run.add_argument("--variant", choices=("baseline", "int8_per_tensor"), default="baseline")
+    run.add_argument("--variant", choices=VARIANTS, default="baseline")
     run.add_argument("--output", type=Path, default=Path("results"))
     run.add_argument("--device", choices=("cpu", "cuda"))
     run.add_argument("--dtype", choices=("float32", "float16", "bfloat16"))

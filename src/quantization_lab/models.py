@@ -35,7 +35,7 @@ def load_model(config):
     return model, tokenizer
 
 
-def quantize_model_int8(model):
+def quantize_model_int8(model, per_channel=False):
     """Replace Qwen's Transformer linear layers in place; return their count.
 
     Restricting the walk to the blocks leaves embeddings, the final norm, and
@@ -47,7 +47,7 @@ def quantize_model_int8(model):
         # Snapshot each parent's children before replacing any of them.
         for name, child in list(parent.named_children()):
             if isinstance(child, torch.nn.Linear):
-                setattr(parent, name, NaiveInt8Linear(child))
+                setattr(parent, name, NaiveInt8Linear(child, per_channel=per_channel))
                 converted += 1
     assert converted > 0, "No linear layers found. Start from the original Qwen checkpoint."
     return converted
