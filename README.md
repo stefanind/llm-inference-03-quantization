@@ -167,13 +167,16 @@ the baseline and quantized runs.
 ## Run all variants together
 
 ```bash
-python -m quantization_lab compare --config configs/smoke.json
+python -m pip install -e .
+python -m quantization_lab compare --config configs/comparison.json
 ```
 
 This runs the baseline and all five quantized variants sequentially. Each gets a
 fresh Python process, so the previous model and its CUDA allocations are released
 before the next variant loads. `--device`, `--dtype`, and `--output` work as they
-do for `run`. Use `configs/comparison.json` when you want the larger workload sample.
+do for `run`. After all variants finish, the command automatically generates the
+four comparison charts. Matplotlib is included in the standard installation, and
+plotting support is checked before starting any experiments.
 
 Everything goes under one folder:
 
@@ -181,6 +184,11 @@ Everything goes under one folder:
 results/<UTC timestamp>-comparison/
   config.json
   comparison.csv
+  plots/
+    quality_and_storage.png
+    prefill.png
+    decode.png
+    peak_memory.png
   <UTC timestamp>-baseline/
   <UTC timestamp>-int8_per_tensor/
   <UTC timestamp>-int8_per_channel/
@@ -222,6 +230,35 @@ cases; for example, `"new_tokens": [32, 128]`.
 Each case has one warmup per batch shape and three measured passes over its prompts. Run the
 smoke preset during development and the comparison preset at milestones. Small
 sample counts are useful engineering checks, not precise tail-latency estimates.
+
+## Plot a completed comparison
+
+`compare` creates the plots automatically. To regenerate them for an existing
+comparison, point `plot` at its saved folder:
+
+```bash
+python -m quantization_lab plot results/<timestamp>-comparison
+```
+
+Replace `<timestamp>-comparison` with your actual folder name. Plotting runs on CPU
+and reads existing reports; it does not load the model or repeat the experiments.
+It also works in a RunPod terminal without a graphical desktop.
+
+Four PNG files are written under that folder's `plots/` directory:
+
+| File | Contents |
+| --- | --- |
+| `quality_and_storage.png` | Perplexity and persistent model MiB, once per variant |
+| `prefill.png` | Prefill time in milliseconds, for each workload |
+| `decode.png` | Total decode tokens/second across the batch, for each workload |
+| `peak_memory.png` | Peak GPU allocated MiB during generation, for each workload |
+
+The comparison preset produces four workload panels per timing or peak-memory
+figure. Panels distinguish batch size, prompt length, and generation length, and
+share a common scale within each figure. Variant colors stay consistent. OOM and
+unavailable values are labeled `OOM` and `N/A`, with no measured bar. Quality and
+persistent storage are not averaged over the repeated workload rows. Repeating
+the plot command regenerates the four images from the current reports.
 
 ## Data and evaluation policy
 
@@ -291,7 +328,7 @@ summary.csv           one row per workload case
 times generation; `results.py` writes plain files. `cli.py` connects those functions
 with a straightforward loop.
 
-Eleven focused tests use generated tensors and a tiny randomly initialized Qwen
+Twelve focused tests use generated tensors and a tiny randomly initialized Qwen
 model. Numerical examples check rounding, scales, and zero rows at both precisions.
 One group-128 numerical test covers multiple groups, rounding, and a zero group.
 One packing test checks known bytes and exact recovery of every emitted INT4 code.
@@ -300,6 +337,8 @@ layers and tied weights, and exercises cached decoding. It verifies that packing
 preserves prefill and decode outputs from the same original weights and saves
 exactly half the code bytes. It also checks that per-channel INT4 and INT8 use the
 same bytes and grouping adds scales.
+One plotting preparation test checks quality deduplication, workload separation,
+and preservation of OOM or unavailable measurements. It does not render images.
 Tests download no weights or data; their timings and perplexities are not
 model-quality or GPU-performance results.
 

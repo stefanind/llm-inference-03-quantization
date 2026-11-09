@@ -1,4 +1,4 @@
-"""A numerical demo, individual experiments, and comparisons of all variants."""
+"""A numerical demo, measured experiments, comparisons, and plots of saved results."""
 
 import argparse
 from datetime import datetime, timezone
@@ -155,14 +155,17 @@ def run_experiment(config, output_root):
 
 
 def run_comparison(config, output_root):
-    """Run each variant in a fresh process, then combine its saved reports."""
+    """Run each variant in a fresh process, then combine and plot its reports."""
     import subprocess
     import sys
 
+    from .plotting import load_pyplot, plot_comparison
     from .results import write_comparison, write_json
 
     config = {**config, "variant": "baseline"}
     validate_config(config)
+    # Check plotting support before starting any GPU work.
+    load_pyplot()
     comparison_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-comparison"
     comparison_dir = Path(output_root) / comparison_id
     comparison_dir.mkdir(parents=True, exist_ok=False)
@@ -184,6 +187,8 @@ def run_comparison(config, output_root):
         write_comparison(comparison_dir / "comparison.csv", run_dirs)
 
     print(f"\nComparison: {comparison_dir / 'comparison.csv'}", flush=True)
+    plot_dir = plot_comparison(comparison_dir)
+    print(f"Plots: {plot_dir}", flush=True)
     return comparison_dir
 
 
@@ -193,7 +198,9 @@ def main():
     commands.add_parser("demo", help="Run the INT8 / INT4 exercise offline on CPU.")
     run = commands.add_parser("run", help="Evaluate and benchmark one model variant.")
     run.add_argument("--variant", choices=VARIANTS, default="baseline")
-    compare = commands.add_parser("compare", help="Run all variants and write one comparison CSV.")
+    compare = commands.add_parser("compare", help="Run all variants and write a comparison CSV and plots.")
+    plot = commands.add_parser("plot", help="Plot a saved comparison folder on CPU.")
+    plot.add_argument("comparison_dir", type=Path)
     for command in (run, compare):
         command.add_argument("--config", type=Path, required=True)
         command.add_argument("--output", type=Path, default=Path("results"))
@@ -205,6 +212,13 @@ def main():
         from .quantizers.symmetric import run_demo
 
         print(json.dumps(run_demo(), indent=2, allow_nan=False))
+        return
+
+    if args.command == "plot":
+        from .plotting import plot_comparison
+
+        output = plot_comparison(args.comparison_dir)
+        print(f"Plots: {output}")
         return
 
     config = json.loads(args.config.read_text(encoding="utf-8"))
