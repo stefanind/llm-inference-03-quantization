@@ -4,9 +4,9 @@ A small project for learning weight quantization by implementing it and measurin
 what changes.
 
 The current milestone compares the floating-point Qwen2.5-0.5B baseline with
-per-tensor and per-output-channel INT8 weights in its Transformer linear layers.
-A standalone matrix exercise explains the arithmetic first. There are no advanced
-quantization methods or serving frameworks in this implementation yet.
+per-tensor INT8, per-output-channel INT8, and unpacked per-channel INT4 weights in
+its Transformer linear layers. A standalone matrix exercise explains the arithmetic
+first. There are no advanced quantization methods or serving frameworks yet.
 
 ## Setup: NVIDIA GPU through WSL/Linux
 
@@ -69,49 +69,63 @@ python -m quantization_lab demo
 python -m unittest discover -s tests -v
 ```
 
-Both commands work offline on CPU. The demo quantizes one matrix with both scale
-granularities, then repeats the comparison with a single large outlier. Compare
-weight MSE and linear output MSE. `num_scales`, `scale_min`, and `scale_max` show
-how the precision is distributed without printing every row's scale.
+Both commands work offline on CPU. The demo compares per-tensor INT8, per-channel
+INT8, and unpacked per-channel INT4 on the same ordinary and outlier matrices.
+Compare weight MSE and linear output MSE. `num_scales`, `scale_min`, and `scale_max`
+show how precision is distributed without printing every row's scale. `bits` is
+the numerical precision, while `storage_dtype` is the actual code storage type.
 
 The 64-by-128 FP32 source matrix uses 32,768 bytes. Its INT8 values use 8,192 bytes:
 per-tensor scaling adds one four-byte scale (8,196 bytes total), while per-channel
-scaling adds 64 scales (8,448 bytes total). The extra scales let unaffected rows
-keep their precision when another row contains an outlier. Weights in the outlier's
-own row still share that row's larger step size. The demo's FP32 source precision
-is separate from the model's BF16 baseline.
+scaling adds 64 scales (8,448 bytes total). Unpacked per-channel INT4 also uses
+8,448 bytes: it has fewer numerical levels, but still stores each code in one
+byte. `quantized_weight_and_scale_bytes` includes the code and scale storage.
 
-Read [the INT8 implementation](src/quantization_lab/quantizers/int8.py) first.
-`NaiveInt8Linear` stores integer weights but reconstructs a floating-point matrix
-on every call. This saves persistent storage; it is not an INT8 matrix multiply.
+The extra per-channel scales let unaffected rows keep their precision when
+another row contains an outlier. Weights in the outlier's own row still share that
+row's larger step size. The demo's FP32 source precision is separate from the
+model's BF16 baseline.
 
-## Compare baseline and INT8
+Read [the symmetric quantizer](src/quantization_lab/quantizers/symmetric.py) first.
+`quantize_weight` accepts `bits=4` or `bits=8`; `NaiveQuantizedLinear` reconstructs
+a floating-point matrix on every call. The implementation uses floating-point
+matrix multiplication for both precisions.
+
+## Compare the model variants
 
 ```bash
 python -m quantization_lab run --config configs/smoke.json --variant baseline
 python -m quantization_lab run --config configs/smoke.json --variant int8_per_tensor
 python -m quantization_lab run --config configs/smoke.json --variant int8_per_channel
+python -m quantization_lab run --config configs/smoke.json --variant int4_per_channel_unpacked
 ```
 
-Each invocation loads the original floating-point checkpoint. Both INT8 variants
-replaces only linear layers inside Qwen's Transformer blocks. Embeddings,
+Each invocation loads the original floating-point checkpoint. All quantized variants
+replace only linear layers inside Qwen's Transformer blocks. Embeddings,
 normalization layers, and the output head remain unchanged, including their weight
 sharing. Per-tensor INT8 stores one FP32 scale for the whole weight matrix.
 Per-channel INT8 stores scales shaped `[out_features, 1]`, computed from the maximum
 absolute weight in each output row. Broadcasting those scales across the input
-columns reconstructs the matrix. Both variants reconstruct weights in the input
-dtype before calling `F.linear`; neither performs an integer matrix multiply.
+columns reconstructs the matrix. Unpacked INT4 uses the same per-channel scale
+layout, but computes `scale = row_max_abs / 7` and codes in `[-7, 7]` instead of
+dividing by 127 and using `[-127, 127]`. This symmetric four-bit convention uses
+15 of the 16 available bit patterns.
+
+All variants reconstruct weights in the input dtype before calling `F.linear`.
+Unpacked INT4 keeps `qweight` as `torch.int8`, so its persistent model tensor bytes
+match per-channel INT8. This iteration isolates numerical damage; packing will
+deliver the four-bit code storage savings in a later experiment.
 
 Numerical checks run during quantization. Forward passes keep only metadata and
 shape assertions, avoiding GPU synchronization from repeatedly checking scales.
 The `dtype` in the environment report is the floating-point compute dtype; INT8
-weights and FP32 scales coexist with it. Smaller persistent storage does not imply
+code buffers and FP32 scales coexist with it. Smaller persistent storage does not imply
 lower peak memory or faster inference.
 
-The variant defaults to `baseline` if omitted. After all three smoke runs work,
+The variant defaults to `baseline` if omitted. After all four smoke runs work,
 repeat them with `--config configs/comparison.json` for a larger measurement sample.
 Keep the model revision, data, image, GPU, and workload settings identical between
-the baseline and INT8 runs.
+the baseline and quantized runs.
 
 The first run downloads Qwen2.5-0.5B and WikiText-2 through Hugging Face. Later runs
 can use its cache. A CPU check is possible with explicit overrides, although the
@@ -202,10 +216,11 @@ summary.csv           one row per workload case
 times generation; `results.py` writes plain files. `cli.py` connects those functions
 with a straightforward loop.
 
-Eight focused tests use generated tensors and a tiny randomly initialized Qwen
-model. One numerical test checks known per-channel scales, rounding, and a zero
-row. The existing conversion integration test runs both granularities and checks
-preserved layers and tied weights, INT8 storage, and working cached decoding.
+Nine focused tests use generated tensors and a tiny randomly initialized Qwen
+model. Numerical examples check rounding, scales, and zero rows at both precisions.
+The existing conversion integration test runs all three quantized variants,
+checks preserved layers and tied weights, and exercises cached decoding. It also
+checks that unpacked INT4 and per-channel INT8 use the same persistent bytes.
 Tests download no weights or data; their timings and perplexities are not
 model-quality or GPU-performance results.
 

@@ -1,4 +1,4 @@
-"""Two commands: a numerical demo and measured baseline / INT8 experiments."""
+"""Two commands: a numerical demo and measured weight quantization experiments."""
 
 import argparse
 from datetime import datetime, timezone
@@ -9,7 +9,7 @@ from pathlib import Path
 import platform
 
 
-VARIANTS = ("baseline", "int8_per_tensor", "int8_per_channel")
+VARIANTS = ("baseline", "int8_per_tensor", "int8_per_channel", "int4_per_channel_unpacked")
 
 
 def validate_config(config):
@@ -48,7 +48,7 @@ def run_experiment(config, output_root):
     from .benchmark import benchmark_case
     from .data import load_tokens, make_prompts
     from .evaluate import evaluate_perplexity
-    from .models import load_model, model_tensor_bytes, quantize_model_int8
+    from .models import load_model, model_tensor_bytes, quantize_model_weights
     from .results import append_measurements, summarize, write_json, write_summary
 
     validate_config(config)
@@ -67,7 +67,9 @@ def run_experiment(config, output_root):
 
     converted_layers = 0
     if variant != "baseline":
-        converted_layers = quantize_model_int8(model, per_channel=variant == "int8_per_channel")
+        bits = 4 if variant == "int4_per_channel_unpacked" else 8
+        per_channel = variant in ("int8_per_channel", "int4_per_channel_unpacked")
+        converted_layers = quantize_model_weights(model, bits=bits, per_channel=per_channel)
         print(f"Converted {converted_layers} Transformer linear layers: {variant}.", flush=True)
 
     token_budget = max(
@@ -144,8 +146,8 @@ def run_experiment(config, output_root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("demo", help="Run the INT8 matrix exercise offline on CPU.")
-    run = commands.add_parser("run", help="Evaluate and benchmark the baseline or INT8 model.")
+    commands.add_parser("demo", help="Run the INT8 / unpacked INT4 exercise offline on CPU.")
+    run = commands.add_parser("run", help="Evaluate and benchmark the baseline or quantized model.")
     run.add_argument("--config", type=Path, required=True)
     run.add_argument("--variant", choices=VARIANTS, default="baseline")
     run.add_argument("--output", type=Path, default=Path("results"))
@@ -154,7 +156,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "demo":
-        from .quantizers.int8 import run_demo
+        from .quantizers.symmetric import run_demo
 
         print(json.dumps(run_demo(), indent=2, allow_nan=False))
         return
