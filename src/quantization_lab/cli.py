@@ -9,7 +9,13 @@ from pathlib import Path
 import platform
 
 
-VARIANTS = ("baseline", "int8_per_tensor", "int8_per_channel", "int4_per_channel_unpacked")
+VARIANTS = (
+    "baseline",
+    "int8_per_tensor",
+    "int8_per_channel",
+    "int4_per_channel_unpacked",
+    "int4_group128_unpacked",
+)
 
 
 def validate_config(config):
@@ -67,9 +73,12 @@ def run_experiment(config, output_root):
 
     converted_layers = 0
     if variant != "baseline":
-        bits = 4 if variant == "int4_per_channel_unpacked" else 8
+        bits = 4 if variant in ("int4_per_channel_unpacked", "int4_group128_unpacked") else 8
         per_channel = variant in ("int8_per_channel", "int4_per_channel_unpacked")
-        converted_layers = quantize_model_weights(model, bits=bits, per_channel=per_channel)
+        grouped = variant == "int4_group128_unpacked"
+        converted_layers = quantize_model_weights(
+            model, bits=bits, per_channel=per_channel, grouped=grouped
+        )
         print(f"Converted {converted_layers} Transformer linear layers: {variant}.", flush=True)
 
     token_budget = max(

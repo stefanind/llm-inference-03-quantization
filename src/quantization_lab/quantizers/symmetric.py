@@ -5,14 +5,22 @@ from torch import nn
 from torch.nn import functional as F
 
 
-def quantize_weight(weight, bits=8, per_channel=False):
+GROUP_SIZE = 128
+
+
+def quantize_weight(weight, bits=8, per_channel=False, grouped=False):
     assert bits in (4, 8), "This experiment supports four-bit or eight-bit precision."
     assert weight.is_floating_point() and weight.numel() > 0
     values = weight.detach().float()
     assert torch.isfinite(values).all(), "Weights must be finite."
-    # Linear weights are [output rows, input columns]. Keeping the column
-    # dimension makes each row's scale broadcast across that row's weights.
-    if per_channel:
+    # Grouping is fixed at 128: [rows, columns] -> [rows, groups, 128].
+    # Qwen's input widths divide evenly, so no padding is needed.
+    if grouped:
+        assert values.ndim == 2 and values.shape[1] % GROUP_SIZE == 0, "Rows must divide into groups of 128."
+        values = values.reshape(values.shape[0], -1, GROUP_SIZE)
+        max_abs = values.abs().amax(dim=2, keepdim=True)
+    elif per_channel:
+        # Keeping the column dimension broadcasts each row's scale correctly.
         assert values.ndim == 2, "Per-channel quantization expects a weight matrix."
         max_abs = values.abs().amax(dim=1, keepdim=True)
     else:
@@ -26,7 +34,8 @@ def quantize_weight(weight, bits=8, per_channel=False):
     qweight = torch.round(values / scale).clamp(-qmax, qmax).to(torch.int8)
     assert torch.isfinite(scale).all() and (scale > 0).all(), "Scales must be finite and positive."
     assert qweight.dtype == torch.int8
-    return qweight, scale
+    # Store the original matrix shape even when scales were chosen by group.
+    return qweight.reshape(weight.shape), scale
 
 
 def dequantize_weight(qweight, scale):
@@ -34,6 +43,11 @@ def dequantize_weight(qweight, scale):
     # synchronize the GPU on every forward, unlike checking a tensor's contents.
     assert qweight.dtype == torch.int8
     assert scale.dtype == torch.float32
+    if scale.ndim == 3:
+        # Restore the group view for broadcasting, then return the original matrix shape.
+        values = qweight.float().reshape(qweight.shape[0], -1, GROUP_SIZE)
+        assert scale.shape == (*values.shape[:2], 1), "Expected one scale per 128-weight group."
+        return (values * scale).reshape(qweight.shape)
     assert scale.ndim == 0 or (
         qweight.ndim == 2 and scale.shape == (qweight.shape[0], 1)
     ), "Expected one scale per matrix or one scale per output row."
@@ -48,13 +62,15 @@ class NaiveQuantizedLinear(nn.Module):
     storage and share the same reconstruction and forward logic.
     """
 
-    def __init__(self, linear, bits=8, per_channel=False):
+    def __init__(self, linear, bits=8, per_channel=False, grouped=False):
         super().__init__()
         assert isinstance(linear, nn.Linear)
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         self.bits = bits
-        qweight, scale = quantize_weight(linear.weight, bits=bits, per_channel=per_channel)
+        qweight, scale = quantize_weight(
+            linear.weight, bits=bits, per_channel=per_channel, grouped=grouped
+        )
         self.register_buffer("qweight", qweight)
         self.register_buffer("scale", scale)
         bias = linear.bias.detach().clone() if linear.bias is not None else None
@@ -72,23 +88,27 @@ class NaiveQuantizedLinear(nn.Module):
 def run_demo():
     """Compare precision and scale granularity on ordinary and outlier weights."""
     generator = torch.Generator().manual_seed(0)
-    inputs = torch.randn(8, 128, generator=generator)
-    weights = torch.randn(64, 128, generator=generator) * 0.1
+    inputs = torch.randn(8, 256, generator=generator)
+    weights = torch.randn(64, 256, generator=generator) * 0.1
     outlier_weights = weights.clone()
     outlier_weights[0, 0] = 10.0
     variants = (
-        ("int8_per_tensor", 8, False),
-        ("int8_per_channel", 8, True),
-        ("int4_per_channel_unpacked", 4, True),
+        ("int8_per_tensor", 8, False, False),
+        ("int8_per_channel", 8, True, False),
+        ("int4_per_channel_unpacked", 4, True, False),
+        ("int4_group128_unpacked", 4, False, True),
     )
     results = []
     for name, weight in (("ordinary", weights), ("one_outlier", outlier_weights)):
-        for variant, bits, per_channel in variants:
-            qweight, scale = quantize_weight(weight, bits=bits, per_channel=per_channel)
+        for variant, bits, per_channel, grouped in variants:
+            qweight, scale = quantize_weight(
+                weight, bits=bits, per_channel=per_channel, grouped=grouped
+            )
             reconstructed = dequantize_weight(qweight, scale)
             error = (weight - reconstructed).abs()
-            # Broadcasting checks each weight against its own scale's half-step.
-            assert (error <= scale / 2 + 1e-6).all(), "Rounding error should be <= half a step."
+            # Match the error's shape to its scales before checking half-step error.
+            error_view = error.reshape(weight.shape[0], -1, GROUP_SIZE) if grouped else error
+            assert (error_view <= scale / 2 + 1e-6).all(), "Rounding error should be <= half a step."
             output_error = F.linear(inputs, weight) - F.linear(inputs, reconstructed)
             weight_bytes = qweight.numel() * qweight.element_size()
             scale_bytes = scale.numel() * scale.element_size()

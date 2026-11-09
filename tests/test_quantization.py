@@ -50,6 +50,20 @@ class QuantizationTests(unittest.TestCase):
         expected = torch.tensor([[7.0, -7.0, 2.0, 0.0], [0.7, -0.7, 0.2, 0.0], [0.0, 0.0, 0.0, 0.0]])
         torch.testing.assert_close(dequantize_weight(codes, scale), expected)
 
+    def test_group128_scales_rounding_and_zero_group(self):
+        # Repeat four known values to fill each 128-weight group.
+        group = torch.tensor([7.0, -7.0, 1.6, -0.4]).repeat(32)
+        weight = torch.cat((group * 0.1, group, torch.zeros_like(group))).unsqueeze(0)
+        codes, scale = quantize_weight(weight, bits=4, grouped=True)
+        expected_codes = torch.tensor([7, -7, 2, 0], dtype=torch.int8).repeat(32)
+        expected = torch.cat((expected_codes, expected_codes, torch.zeros_like(expected_codes)))
+        torch.testing.assert_close(codes, expected.unsqueeze(0))
+        torch.testing.assert_close(scale, torch.tensor([[[0.1], [1.0], [1.0]]]))
+        small = torch.tensor([0.7, -0.7, 0.2, 0.0]).repeat(32)
+        large = torch.tensor([7.0, -7.0, 2.0, 0.0]).repeat(32)
+        reconstructed = torch.cat((small, large, torch.zeros_like(large))).unsqueeze(0)
+        torch.testing.assert_close(dequantize_weight(codes, scale), reconstructed)
+
     def test_linear_matches_known_reconstructed_weights(self):
         inputs = torch.tensor([[[1.0, 2.0, 3.0], [-1.0, 0.0, 2.0]]])
         expected_weights = torch.tensor([[-127.0, 0.0, 1.0], [1.0, 3.0, 127.0]])
@@ -75,14 +89,15 @@ class QuantizationTests(unittest.TestCase):
 
     def test_qwen_conversion_preserves_excluded_layers_and_cached_decoding(self):
         config = Qwen2Config(
-            vocab_size=32, hidden_size=16, intermediate_size=32,
+            vocab_size=32, hidden_size=128, intermediate_size=256,
             num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1,
             max_position_embeddings=64, tie_word_embeddings=True,
             attn_implementation="sdpa",
         )
         storage_bytes = {}
-        for bits, per_channel in ((8, False), (8, True), (4, True)):
-            with self.subTest(bits=bits, per_channel=per_channel):
+        modes = ((8, False, False), (8, True, False), (4, True, False), (4, False, True))
+        for bits, per_channel, grouped in modes:
+            with self.subTest(bits=bits, per_channel=per_channel, grouped=grouped):
                 model = Qwen2ForCausalLM(config).eval()
                 embeddings = model.model.embed_tokens
                 head = model.lm_head
@@ -93,7 +108,8 @@ class QuantizationTests(unittest.TestCase):
                 original_bytes = model_tensor_bytes(model)
 
                 # One block has four attention projections and three MLP projections.
-                self.assertEqual(quantize_model_weights(model, bits=bits, per_channel=per_channel), 7)
+                count = quantize_model_weights(model, bits=bits, per_channel=per_channel, grouped=grouped)
+                self.assertEqual(count, 7)
                 converted = [m for m in model.model.layers.modules() if isinstance(m, NaiveQuantizedLinear)]
                 self.assertEqual(len(converted), 7)
                 self.assertFalse(any(isinstance(m, nn.Linear) for m in model.model.layers.modules()))
@@ -101,7 +117,10 @@ class QuantizationTests(unittest.TestCase):
                     self.assertEqual(layer.qweight.dtype, torch.int8)
                     self.assertEqual(layer.bits, bits)
                     self.assertEqual(layer.scale.dtype, torch.float32)
-                    expected_shape = (layer.out_features, 1) if per_channel else ()
+                    if grouped:
+                        expected_shape = (layer.out_features, layer.in_features // 128, 1)
+                    else:
+                        expected_shape = (layer.out_features, 1) if per_channel else ()
                     self.assertEqual(layer.scale.shape, expected_shape)
                     self.assertFalse(layer.training)
                 self.assertIs(model.model.embed_tokens, embeddings)
@@ -109,8 +128,8 @@ class QuantizationTests(unittest.TestCase):
                 self.assertIs(model.lm_head.weight, model.model.embed_tokens.weight)
                 for name, expected in norm_weights.items():
                     torch.testing.assert_close(model.get_parameter(name), expected)
-                storage_bytes[bits, per_channel] = model_tensor_bytes(model)
-                self.assertLess(storage_bytes[bits, per_channel], original_bytes)
+                storage_bytes[bits, per_channel, grouped] = model_tensor_bytes(model)
+                self.assertLess(storage_bytes[bits, per_channel, grouped], original_bytes)
 
                 with torch.inference_mode():
                     inputs = torch.tensor([[1, 2, 3], [4, 5, 6]])
@@ -124,7 +143,8 @@ class QuantizationTests(unittest.TestCase):
                 self.assertTrue(torch.isfinite(decode.logits).all())
 
         # Four-bit codes are still unpacked: they save no bytes over per-channel INT8.
-        self.assertEqual(storage_bytes[4, True], storage_bytes[8, True])
+        self.assertEqual(storage_bytes[4, True, False], storage_bytes[8, True, False])
+        self.assertGreater(storage_bytes[4, False, True], storage_bytes[4, True, False])
 
 
 if __name__ == "__main__":
