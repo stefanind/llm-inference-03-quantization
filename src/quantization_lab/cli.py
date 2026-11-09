@@ -1,4 +1,4 @@
-"""Two commands: a numerical demo and measured weight quantization experiments."""
+"""A numerical demo, individual experiments, and comparisons of all variants."""
 
 import argparse
 from datetime import datetime, timezone
@@ -15,6 +15,7 @@ VARIANTS = (
     "int8_per_channel",
     "int4_per_channel_unpacked",
     "int4_group128_unpacked",
+    "int4_group128_packed",
 )
 
 
@@ -73,11 +74,12 @@ def run_experiment(config, output_root):
 
     converted_layers = 0
     if variant != "baseline":
-        bits = 4 if variant in ("int4_per_channel_unpacked", "int4_group128_unpacked") else 8
+        bits = 8 if variant in ("int8_per_tensor", "int8_per_channel") else 4
         per_channel = variant in ("int8_per_channel", "int4_per_channel_unpacked")
-        grouped = variant == "int4_group128_unpacked"
+        grouped = variant in ("int4_group128_unpacked", "int4_group128_packed")
+        packed = variant == "int4_group128_packed"
         converted_layers = quantize_model_weights(
-            model, bits=bits, per_channel=per_channel, grouped=grouped
+            model, bits=bits, per_channel=per_channel, grouped=grouped, packed=packed
         )
         print(f"Converted {converted_layers} Transformer linear layers: {variant}.", flush=True)
 
@@ -152,16 +154,51 @@ def run_experiment(config, output_root):
     return run_dir
 
 
+def run_comparison(config, output_root):
+    """Run each variant in a fresh process, then combine its saved reports."""
+    import subprocess
+    import sys
+
+    from .results import write_comparison, write_json
+
+    config = {**config, "variant": "baseline"}
+    validate_config(config)
+    comparison_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-comparison"
+    comparison_dir = Path(output_root) / comparison_id
+    comparison_dir.mkdir(parents=True, exist_ok=False)
+    config_path = comparison_dir / "config.json"
+    write_json(config_path, config)
+
+    run_dirs = []
+    for variant in VARIANTS:
+        print(f"\nRunning {variant} ({len(run_dirs) + 1}/{len(VARIANTS)})...", flush=True)
+        # Exiting each process releases its model, KV cache, and CUDA allocations.
+        subprocess.run([
+            sys.executable, "-m", "quantization_lab", "run",
+            "--config", str(config_path), "--variant", variant,
+            "--output", str(comparison_dir),
+        ], check=True)
+        run_dir, = comparison_dir.glob(f"*-{variant}")
+        run_dirs.append(run_dir)
+        # Save progress after every completed variant, including the baseline.
+        write_comparison(comparison_dir / "comparison.csv", run_dirs)
+
+    print(f"\nComparison: {comparison_dir / 'comparison.csv'}", flush=True)
+    return comparison_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("demo", help="Run the INT8 / unpacked INT4 exercise offline on CPU.")
-    run = commands.add_parser("run", help="Evaluate and benchmark the baseline or quantized model.")
-    run.add_argument("--config", type=Path, required=True)
+    commands.add_parser("demo", help="Run the INT8 / INT4 exercise offline on CPU.")
+    run = commands.add_parser("run", help="Evaluate and benchmark one model variant.")
     run.add_argument("--variant", choices=VARIANTS, default="baseline")
-    run.add_argument("--output", type=Path, default=Path("results"))
-    run.add_argument("--device", choices=("cpu", "cuda"))
-    run.add_argument("--dtype", choices=("float32", "float16", "bfloat16"))
+    compare = commands.add_parser("compare", help="Run all variants and write one comparison CSV.")
+    for command in (run, compare):
+        command.add_argument("--config", type=Path, required=True)
+        command.add_argument("--output", type=Path, default=Path("results"))
+        command.add_argument("--device", choices=("cpu", "cuda"))
+        command.add_argument("--dtype", choices=("float32", "float16", "bfloat16"))
     args = parser.parse_args()
 
     if args.command == "demo":
@@ -171,9 +208,12 @@ def main():
         return
 
     config = json.loads(args.config.read_text(encoding="utf-8"))
-    config["variant"] = args.variant
     if args.device:
         config["model"]["device"] = args.device
     if args.dtype:
         config["model"]["dtype"] = args.dtype
-    run_experiment(config, args.output)
+    if args.command == "compare":
+        run_comparison(config, args.output)
+    else:
+        config["variant"] = args.variant
+        run_experiment(config, args.output)

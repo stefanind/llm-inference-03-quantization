@@ -1,8 +1,10 @@
-"""Symmetric INT8 and unpacked INT4, with FP32 scales and INT8 storage."""
+"""Symmetric INT8 and INT4, with FP32 scales and optional INT4 packing."""
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+from .packing import pack_int4, unpack_int4
 
 
 GROUP_SIZE = 128
@@ -30,7 +32,7 @@ def quantize_weight(weight, bits=8, per_channel=False, grouped=False):
     scale = max_abs / qmax
     # A zero matrix or row needs a safe scale. This also handles underflow to zero.
     scale = torch.where(scale == 0, torch.ones_like(scale), scale)
-    # INT4 codes still occupy an entire byte here. Packing is a later experiment.
+    # Start with one code per byte. Optional INT4 packing happens afterward.
     qweight = torch.round(values / scale).clamp(-qmax, qmax).to(torch.int8)
     assert torch.isfinite(scale).all() and (scale > 0).all(), "Scales must be finite and positive."
     assert qweight.dtype == torch.int8
@@ -58,19 +60,24 @@ class NaiveQuantizedLinear(nn.Module):
     """Store compressed weights; deliberately reconstruct them on every forward.
 
     This teaches the difference between compressed storage and fast execution.
-    F.linear still performs floating-point computation. Both precisions use INT8
-    storage and share the same reconstruction and forward logic.
+    F.linear still performs floating-point computation. Packed INT4 first unpacks
+    its codes, then uses the same reconstruction as the unpacked variants.
     """
 
-    def __init__(self, linear, bits=8, per_channel=False, grouped=False):
+    def __init__(self, linear, bits=8, per_channel=False, grouped=False, packed=False):
         super().__init__()
         assert isinstance(linear, nn.Linear)
+        assert not packed or bits == 4, "Packing requires four-bit codes."
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         self.bits = bits
+        self.packed = packed
         qweight, scale = quantize_weight(
             linear.weight, bits=bits, per_channel=per_channel, grouped=grouped
         )
+        # Keep only the packed buffer; the unpacked codes are temporary.
+        if packed:
+            qweight = pack_int4(qweight)
         self.register_buffer("qweight", qweight)
         self.register_buffer("scale", scale)
         bias = linear.bias.detach().clone() if linear.bias is not None else None
@@ -79,45 +86,49 @@ class NaiveQuantizedLinear(nn.Module):
 
     def forward(self, x):
         assert x.shape[-1] == self.in_features
-        weight = dequantize_weight(self.qweight, self.scale).to(x.dtype)
+        codes = unpack_int4(self.qweight) if self.packed else self.qweight
+        weight = dequantize_weight(codes, self.scale).to(x.dtype)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, weight, bias)
 
 
 @torch.inference_mode()
 def run_demo():
-    """Compare precision and scale granularity on ordinary and outlier weights."""
+    """Compare precision, scale granularity, and storage on two weight matrices."""
     generator = torch.Generator().manual_seed(0)
     inputs = torch.randn(8, 256, generator=generator)
     weights = torch.randn(64, 256, generator=generator) * 0.1
     outlier_weights = weights.clone()
     outlier_weights[0, 0] = 10.0
     variants = (
-        ("int8_per_tensor", 8, False, False),
-        ("int8_per_channel", 8, True, False),
-        ("int4_per_channel_unpacked", 4, True, False),
-        ("int4_group128_unpacked", 4, False, True),
+        ("int8_per_tensor", 8, False, False, False),
+        ("int8_per_channel", 8, True, False, False),
+        ("int4_per_channel_unpacked", 4, True, False, False),
+        ("int4_group128_unpacked", 4, False, True, False),
+        ("int4_group128_packed", 4, False, True, True),
     )
     results = []
     for name, weight in (("ordinary", weights), ("one_outlier", outlier_weights)):
-        for variant, bits, per_channel, grouped in variants:
+        for variant, bits, per_channel, grouped, packed in variants:
             qweight, scale = quantize_weight(
                 weight, bits=bits, per_channel=per_channel, grouped=grouped
             )
-            reconstructed = dequantize_weight(qweight, scale)
+            stored = pack_int4(qweight) if packed else qweight
+            codes = unpack_int4(stored) if packed else stored
+            reconstructed = dequantize_weight(codes, scale)
             error = (weight - reconstructed).abs()
             # Match the error's shape to its scales before checking half-step error.
             error_view = error.reshape(weight.shape[0], -1, GROUP_SIZE) if grouped else error
             assert (error_view <= scale / 2 + 1e-6).all(), "Rounding error should be <= half a step."
             output_error = F.linear(inputs, weight) - F.linear(inputs, reconstructed)
-            weight_bytes = qweight.numel() * qweight.element_size()
+            weight_bytes = stored.numel() * stored.element_size()
             scale_bytes = scale.numel() * scale.element_size()
             results.append({
                 "example": name,
                 "variant": variant,
                 "bits": bits,
                 "source_dtype": str(weight.dtype),
-                "storage_dtype": str(qweight.dtype),
+                "storage_dtype": str(stored.dtype),
                 "num_scales": scale.numel(),
                 "scale_min": scale.min().item(),
                 "scale_max": scale.max().item(),

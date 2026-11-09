@@ -35,7 +35,7 @@ def load_model(config):
     return model, tokenizer
 
 
-def quantize_model_weights(model, bits=8, per_channel=False, grouped=False):
+def quantize_model_weights(model, bits=8, per_channel=False, grouped=False, packed=False):
     """Replace Qwen's Transformer linear layers in place; return their count.
 
     Restricting the walk to the blocks leaves embeddings, the final norm, and
@@ -48,7 +48,7 @@ def quantize_model_weights(model, bits=8, per_channel=False, grouped=False):
         for name, child in list(parent.named_children()):
             if isinstance(child, torch.nn.Linear):
                 replacement = NaiveQuantizedLinear(
-                    child, bits=bits, per_channel=per_channel, grouped=grouped
+                    child, bits=bits, per_channel=per_channel, grouped=grouped, packed=packed
                 )
                 setattr(parent, name, replacement)
                 converted += 1

@@ -5,8 +5,9 @@ what changes.
 
 The current milestone compares the floating-point Qwen2.5-0.5B baseline with
 per-tensor INT8, per-output-channel INT8, and unpacked INT4 with either per-channel
-scales or fixed groups of 128. A standalone matrix exercise explains the arithmetic
-first. There are no advanced quantization methods or serving frameworks yet.
+scales or fixed groups of 128. Packed group-128 INT4 stores the same codes in half
+as many bytes. A standalone matrix exercise explains the arithmetic first. There
+are no advanced quantization methods or serving frameworks yet.
 
 ## Setup: NVIDIA GPU through WSL/Linux
 
@@ -85,6 +86,7 @@ bytes. `quantized_weight_and_scale_bytes` also includes the FP32 scales:
 | Per-channel INT8 | 64 | 16,640 |
 | Unpacked per-channel INT4 | 64 | 16,640 |
 | Unpacked group-128 INT4 | 128 | 16,896 |
+| Packed group-128 INT4 | 128 | 8,704 |
 
 The extra per-channel scales let unaffected rows keep their precision when
 another row contains an outlier. Weights in the outlier's own row still share that
@@ -96,18 +98,20 @@ from the model's BF16 baseline.
 Read [the symmetric quantizer](src/quantization_lab/quantizers/symmetric.py) first.
 `quantize_weight` accepts `bits=4` or `bits=8`; `NaiveQuantizedLinear` reconstructs
 a floating-point matrix on every call. The implementation uses floating-point
-matrix multiplication for both precisions.
+matrix multiplication for both precisions. Packed and unpacked group-128 INT4
+have identical scales, weight MSE, and output MSE. Only their code storage changes:
+16,384 bytes becomes 8,192 bytes, with the same 512 bytes of FP32 scales.
 
-## Compare per-channel and group-128 INT4
+## Compare unpacked and packed group-128 INT4
 
 ```bash
-python -m quantization_lab run --config configs/smoke.json --variant int4_per_channel_unpacked
 python -m quantization_lab run --config configs/smoke.json --variant int4_group128_unpacked
+python -m quantization_lab run --config configs/smoke.json --variant int4_group128_packed
 ```
 
-The earlier `baseline`, `int8_per_tensor`, and `int8_per_channel` variants remain
-available. This iteration needs only the two INT4 runs above, with the same
-configuration and hardware.
+The earlier `baseline`, `int8_per_tensor`, `int8_per_channel`, and
+`int4_per_channel_unpacked` variants remain available. This iteration needs only
+the two group-128 runs above, with the same configuration and hardware.
 
 Each invocation loads the original floating-point checkpoint. All quantized variants
 replace only linear layers inside Qwen's Transformer blocks. Embeddings,
@@ -121,9 +125,21 @@ dividing by 127 and using `[-127, 127]`. This symmetric four-bit convention uses
 15 of the 16 available bit patterns.
 
 Group-128 INT4 reshapes each matrix from `[rows, columns]` to `[rows, groups, 128]`
-to choose scales shaped `[rows, groups, 1]`. Codes are stored in the original
+to choose scales shaped `[rows, groups, 1]`. Unpacked codes retain the original
 matrix shape. Reconstruction temporarily restores the grouped view, multiplies
 by the scales, then returns to the original shape for `F.linear`.
+
+The [packing helpers](src/quantization_lab/quantizers/packing.py) put the first code
+in a byte's upper four bits and the second in its lower four bits. Negative codes
+use four-bit two's complement: `[-7, 7]` becomes `1001 0111` (`0x97`). Unpacking
+extracts the nibbles in order and subtracts 16 from values 8 through 15 to restore
+their sign. Packing loses no information and introduces no additional rounding.
+
+The packed layer keeps only a `torch.uint8` code buffer shaped
+`[out_features, in_features / 2]`, plus the unchanged FP32 scales and any bias.
+It unpacks codes into the original matrix shape on every forward, then follows
+the same dequantization and floating-point `F.linear` path. It does not retain an
+unpacked backup of the weights.
 
 Only group size 128 is supported; there is no group-size argument or sweep.
 Qwen2.5-0.5B's relevant input widths, 896 and 4,864, divide evenly by 128. A
@@ -131,20 +147,60 @@ divisibility assertion keeps the code simple, with no padding or partial groups.
 
 All variants reconstruct weights in the input dtype before calling `F.linear`.
 Unpacked INT4 keeps `qweight` as `torch.int8`. Per-channel INT4 therefore matches
-per-channel INT8 storage, while group-128 INT4 adds more scales. This iteration
-measures the quality versus scale-storage tradeoff. Packing will deliver the
-four-bit code storage savings in a later experiment.
+per-channel INT8 storage, while group-128 INT4 adds more scales. Packing halves
+the code bytes, not the scales or unconverted layers. This iteration measures the
+storage savings and the execution cost of unpacking on every forward. This is a
+storage exercise; there is no optimized integer matrix multiplication kernel.
 
 Numerical checks run during quantization. Forward passes keep only metadata and
 shape assertions, avoiding GPU synchronization from repeatedly checking scales.
-The `dtype` in the environment report is the floating-point compute dtype; INT8
-code buffers and FP32 scales coexist with it. Smaller persistent storage does not imply
-lower peak memory or faster inference.
+The `dtype` in the environment report is the floating-point compute dtype; integer
+code buffers and FP32 scales coexist with it. Smaller persistent storage does not
+imply lower peak memory or faster inference. Unpacking creates temporary tensors
+and adds work, so the packed variant may be slower.
 
 The variant defaults to `baseline` if omitted. After the two INT4 smoke runs work,
 use `--config configs/comparison.json` if a larger measurement sample is needed.
 Keep the model revision, data, image, GPU, and workload settings identical between
 the baseline and quantized runs.
+
+## Run all variants together
+
+```bash
+python -m quantization_lab compare --config configs/smoke.json
+```
+
+This runs the baseline and all five quantized variants sequentially. Each gets a
+fresh Python process, so the previous model and its CUDA allocations are released
+before the next variant loads. `--device`, `--dtype`, and `--output` work as they
+do for `run`. Use `configs/comparison.json` when you want the larger workload sample.
+
+Everything goes under one folder:
+
+```text
+results/<UTC timestamp>-comparison/
+  config.json
+  comparison.csv
+  <UTC timestamp>-baseline/
+  <UTC timestamp>-int8_per_tensor/
+  <UTC timestamp>-int8_per_channel/
+  <UTC timestamp>-int4_per_channel_unpacked/
+  <UTC timestamp>-int4_group128_unpacked/
+  <UTC timestamp>-int4_group128_packed/
+```
+
+Open `comparison.csv` for the combined view. Each row includes the variant,
+perplexity, persistent model tensor bytes, batch size, prompt and generation
+lengths, prefill time, decode throughput, peak GPU allocated bytes, and status.
+Matching workloads appear together, with the baseline first. Byte counts retain
+their original units; divide by 1,048,576 for MiB. Quality and persistent storage
+are measured once per variant and repeated beside each workload's timing results.
+The original JSON and CSV reports remain in each run folder.
+
+The comparison is updated after each completed variant. Configuration, software,
+hardware, resolved model revision, and token-sample metadata must match before a
+run's rows are added. An OOM benchmark case retains its status and empty timing
+fields. A failed run stops the command and leaves the completed results available.
 
 The first run downloads Qwen2.5-0.5B and WikiText-2 through Hugging Face. Later runs
 can use its cache. A CPU check is possible with explicit overrides, although the
@@ -235,12 +291,15 @@ summary.csv           one row per workload case
 times generation; `results.py` writes plain files. `cli.py` connects those functions
 with a straightforward loop.
 
-Ten focused tests use generated tensors and a tiny randomly initialized Qwen
+Eleven focused tests use generated tensors and a tiny randomly initialized Qwen
 model. Numerical examples check rounding, scales, and zero rows at both precisions.
 One group-128 numerical test covers multiple groups, rounding, and a zero group.
-The existing conversion integration test runs all four quantized variants,
-checks preserved layers and tied weights, and exercises cached decoding. It also
-checks that per-channel INT4 and INT8 use the same bytes and grouping adds scales.
+One packing test checks known bytes and exact recovery of every emitted INT4 code.
+The conversion integration test runs all five quantized variants, checks preserved
+layers and tied weights, and exercises cached decoding. It verifies that packing
+preserves prefill and decode outputs from the same original weights and saves
+exactly half the code bytes. It also checks that per-channel INT4 and INT8 use the
+same bytes and grouping adds scales.
 Tests download no weights or data; their timings and perplexities are not
 model-quality or GPU-performance results.
 

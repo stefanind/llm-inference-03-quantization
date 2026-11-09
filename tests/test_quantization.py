@@ -6,6 +6,7 @@ from torch.nn import functional as F
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
 from quantization_lab.models import model_tensor_bytes, quantize_model_weights
+from quantization_lab.quantizers.packing import pack_int4, unpack_int4
 from quantization_lab.quantizers.symmetric import (
     NaiveQuantizedLinear,
     dequantize_weight,
@@ -78,6 +79,20 @@ class QuantizationTests(unittest.TestCase):
             torch.testing.assert_close(layer(inputs), expected)
             self.assertEqual(layer.qweight.dtype, torch.int8)
 
+    def test_int4_packing_known_bytes_and_round_trip(self):
+        # Cover every emitted code, including negatives and both ends of [-7, 7].
+        codes = torch.tensor([
+            [-7, -6, -5, -4, -3, -2, -1, 0],
+            [1, 2, 3, 4, 5, 6, 7, 0],
+        ], dtype=torch.int8)
+        expected = torch.tensor([
+            [0x9A, 0xBC, 0xDE, 0xF0],
+            [0x12, 0x34, 0x56, 0x70],
+        ], dtype=torch.uint8)
+        packed = pack_int4(codes)
+        torch.testing.assert_close(packed, expected)
+        torch.testing.assert_close(unpack_int4(packed), codes)
+
     def test_shared_weights_and_views_are_counted_once(self):
         model = nn.Module()
         model.embedding = nn.Embedding(5, 4)
@@ -94,11 +109,19 @@ class QuantizationTests(unittest.TestCase):
             max_position_embeddings=64, tie_word_embeddings=True,
             attn_implementation="sdpa",
         )
+        # Use identical original weights so packing's effect can be isolated.
+        initial_state = Qwen2ForCausalLM(config).state_dict()
         storage_bytes = {}
-        modes = ((8, False, False), (8, True, False), (4, True, False), (4, False, True))
-        for bits, per_channel, grouped in modes:
-            with self.subTest(bits=bits, per_channel=per_channel, grouped=grouped):
+        outputs = {}
+        modes = (
+            (8, False, False, False), (8, True, False, False),
+            (4, True, False, False), (4, False, True, False), (4, False, True, True),
+        )
+        for mode in modes:
+            bits, per_channel, grouped, packed = mode
+            with self.subTest(mode=mode):
                 model = Qwen2ForCausalLM(config).eval()
+                model.load_state_dict(initial_state)
                 embeddings = model.model.embed_tokens
                 head = model.lm_head
                 norm_weights = {
@@ -108,13 +131,17 @@ class QuantizationTests(unittest.TestCase):
                 original_bytes = model_tensor_bytes(model)
 
                 # One block has four attention projections and three MLP projections.
-                count = quantize_model_weights(model, bits=bits, per_channel=per_channel, grouped=grouped)
+                count = quantize_model_weights(
+                    model, bits=bits, per_channel=per_channel, grouped=grouped, packed=packed
+                )
                 self.assertEqual(count, 7)
                 converted = [m for m in model.model.layers.modules() if isinstance(m, NaiveQuantizedLinear)]
                 self.assertEqual(len(converted), 7)
                 self.assertFalse(any(isinstance(m, nn.Linear) for m in model.model.layers.modules()))
                 for layer in converted:
-                    self.assertEqual(layer.qweight.dtype, torch.int8)
+                    self.assertEqual(layer.qweight.dtype, torch.uint8 if packed else torch.int8)
+                    columns = layer.in_features // 2 if packed else layer.in_features
+                    self.assertEqual(layer.qweight.shape, (layer.out_features, columns))
                     self.assertEqual(layer.bits, bits)
                     self.assertEqual(layer.scale.dtype, torch.float32)
                     if grouped:
@@ -128,8 +155,10 @@ class QuantizationTests(unittest.TestCase):
                 self.assertIs(model.lm_head.weight, model.model.embed_tokens.weight)
                 for name, expected in norm_weights.items():
                     torch.testing.assert_close(model.get_parameter(name), expected)
-                storage_bytes[bits, per_channel, grouped] = model_tensor_bytes(model)
-                self.assertLess(storage_bytes[bits, per_channel, grouped], original_bytes)
+                storage_bytes[mode] = model_tensor_bytes(model)
+                self.assertLess(storage_bytes[mode], original_bytes)
+                if grouped and not packed:
+                    unpacked_code_bytes = sum(m.qweight.numel() * m.qweight.element_size() for m in converted)
 
                 with torch.inference_mode():
                     inputs = torch.tensor([[1, 2, 3], [4, 5, 6]])
@@ -141,10 +170,16 @@ class QuantizationTests(unittest.TestCase):
                 self.assertEqual(decode.past_key_values.get_seq_length(), 4)
                 self.assertTrue(torch.isfinite(prefill.logits).all())
                 self.assertTrue(torch.isfinite(decode.logits).all())
+                outputs[mode] = torch.cat((prefill.logits, decode.logits), dim=1)
 
         # Four-bit codes are still unpacked: they save no bytes over per-channel INT8.
-        self.assertEqual(storage_bytes[4, True, False], storage_bytes[8, True, False])
-        self.assertGreater(storage_bytes[4, False, True], storage_bytes[4, True, False])
+        self.assertEqual(storage_bytes[4, True, False, False], storage_bytes[8, True, False, False])
+        self.assertGreater(storage_bytes[4, False, True, False], storage_bytes[4, True, False, False])
+        unpacked = (4, False, True, False)
+        packed = (4, False, True, True)
+        # Only code storage halves. Scales and all unconverted tensors stay the same.
+        self.assertEqual(storage_bytes[packed], storage_bytes[unpacked] - unpacked_code_bytes // 2)
+        torch.testing.assert_close(outputs[packed], outputs[unpacked], rtol=0, atol=0)
 
 
 if __name__ == "__main__":
