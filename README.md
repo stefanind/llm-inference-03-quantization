@@ -3,9 +3,10 @@
 A small project for learning weight quantization by implementing it and measuring
 what changes.
 
-The current milestone contains a floating-point baseline runner and a standalone
-per-tensor INT8 exercise. Model-wide INT8 replacement is the next milestone. There
-are no advanced quantization methods or serving frameworks in this implementation yet.
+The current milestone compares the floating-point Qwen2.5-0.5B baseline with
+per-tensor INT8 weights in its Transformer linear layers. A standalone matrix
+exercise explains the arithmetic first. There are no advanced quantization methods
+or serving frameworks in this implementation yet.
 
 ## Setup: NVIDIA GPU through WSL/Linux
 
@@ -77,12 +78,29 @@ Read [the INT8 implementation](src/quantization_lab/quantizers/int8.py) first.
 `NaiveInt8Linear` stores integer weights but reconstructs a floating-point matrix
 on every call. This saves persistent storage; it is not an INT8 matrix multiply.
 
-## Run the baseline
+## Compare baseline and INT8
 
 ```bash
-python -m quantization_lab run --config configs/smoke.json
-python -m quantization_lab run --config configs/comparison.json
+python -m quantization_lab run --config configs/smoke.json --variant baseline
+python -m quantization_lab run --config configs/smoke.json --variant int8_per_tensor
 ```
+
+Each invocation loads the original floating-point checkpoint. The INT8 variant
+replaces only linear layers inside Qwen's Transformer blocks. Embeddings,
+normalization layers, and the output head remain unchanged, including their weight
+sharing. Each converted weight matrix gets one FP32 scale; the forward pass
+reconstructs weights in the input dtype before calling `F.linear`.
+
+Numerical checks run during quantization. Forward passes keep only metadata and
+shape assertions, avoiding GPU synchronization from repeatedly checking scales.
+The `dtype` in the environment report is the floating-point compute dtype; INT8
+weights and FP32 scales coexist with it. Smaller persistent storage does not imply
+lower peak memory or faster inference.
+
+The variant defaults to `baseline` if omitted. After both smoke runs work, repeat
+the pair with `--config configs/comparison.json` for a larger measurement sample.
+Keep the model revision, data, image, GPU, and workload settings identical between
+the baseline and INT8 runs.
 
 The first run downloads Qwen2.5-0.5B and WikiText-2 through Hugging Face. Later runs
 can use its cache. A CPU check is possible with explicit overrides, although the
@@ -158,22 +176,23 @@ stop the run instead of yielding an apparently valid comparison.
 
 ## Results and code map
 
-Each run creates `results/<UTC timestamp>-baseline/`:
+Each run creates `results/<UTC timestamp>-<variant>/`:
 
 ```text
-config.json           actual settings, including CLI overrides
-environment.json      software, device, model revision, tensor bytes, input hash
+config.json           actual settings, including variant and CLI overrides
+environment.json      software, device, revision, converted-layer count, tensor bytes, input hash
 evaluation.json       perplexity, mean loss, scored tokens, window settings
 measurements.jsonl    individual batch measurements and prompt IDs
 summary.csv           one row per workload case
 ```
 
-`models.py` loads the model and counts storage; `data.py` prepares text and prompts;
-`evaluate.py` scores quality; `benchmark.py` times generation; `results.py` writes
-plain files. `cli.py` connects those functions with a straightforward loop.
+`models.py` loads the model, converts its linear layers, and counts storage;
+`data.py` prepares text and prompts; `evaluate.py` scores quality; `benchmark.py`
+times generation; `results.py` writes plain files. `cli.py` connects those functions
+with a straightforward loop.
 
-Tests use generated tensors and a tiny randomly initialized Qwen model. They check
-correctness without downloading weights or data; their timings and perplexities
-are not model-quality or GPU-performance results.
+Seven focused tests use generated tensors and a tiny randomly initialized Qwen
+model. The conversion integration test checks preserved layers and tied weights,
+INT8 storage, and working cached decoding. Tests download no weights or data;
+their timings and perplexities are not model-quality or GPU-performance results.
 
-See [PLAN.md](PLAN.md) for the next small experiments.

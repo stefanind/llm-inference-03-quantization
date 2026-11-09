@@ -1,4 +1,4 @@
-"""Two commands: a numerical demo and a measured floating-point baseline."""
+"""Two commands: a numerical demo and measured baseline / INT8 experiments."""
 
 import argparse
 from datetime import datetime, timezone
@@ -11,6 +11,8 @@ import platform
 
 def validate_config(config):
     """Reject invalid user settings before downloading a model or dataset."""
+    if config.get("variant", "baseline") not in ("baseline", "int8_per_tensor"):
+        raise ValueError("variant must be baseline or int8_per_tensor.")
     evaluation = config["evaluation"]
     benchmark = config["benchmark"]
     for name in ("max_tokens", "context_length", "stride"):
@@ -43,12 +45,14 @@ def run_experiment(config, output_root):
     from .benchmark import benchmark_case
     from .data import load_tokens, make_prompts
     from .evaluate import evaluate_perplexity
-    from .models import load_model, model_tensor_bytes
+    from .models import load_model, model_tensor_bytes, quantize_model_int8
     from .results import append_measurements, summarize, write_json, write_summary
 
     validate_config(config)
+    variant = config.get("variant", "baseline")
     torch.manual_seed(config["seed"])
-    print("Loading the floating-point baseline...", flush=True)
+    # Every run starts from the original weights, never a previously quantized model.
+    print("Loading the original floating-point checkpoint...", flush=True)
     model, tokenizer = load_model(config["model"])
     benchmark = config["benchmark"]
     evaluation = config["evaluation"]
@@ -58,6 +62,11 @@ def run_experiment(config, output_root):
     if evaluation["context_length"] > context_limit:
         raise ValueError("Evaluation context length exceeds the model context limit.")
 
+    converted_layers = 0
+    if variant == "int8_per_tensor":
+        converted_layers = quantize_model_int8(model)
+        print(f"Converted {converted_layers} Transformer linear layers to INT8.", flush=True)
+
     token_budget = max(
         evaluation["max_tokens"],
         max(benchmark["prompt_lengths"]) * benchmark["num_prompts_per_length"],
@@ -65,14 +74,15 @@ def run_experiment(config, output_root):
     print("Preparing the fixed text sample...", flush=True)
     tokens, dataset_metadata = load_tokens(config["dataset"], tokenizer, token_budget)
 
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-baseline"
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + f"-{variant}"
     run_dir = Path(output_root) / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
     write_json(run_dir / "config.json", config)
     device = next(model.parameters()).device
     write_json(run_dir / "environment.json", {
         "schema_version": 1,
-        "variant": "baseline",
+        "variant": variant,
+        "converted_linear_layers": converted_layers,
         "python": platform.python_version(),
         "platform": platform.platform(),
         "torch": torch.__version__,
@@ -102,7 +112,7 @@ def run_experiment(config, output_root):
         prompts, prompt_ids = make_prompts(tokens, length, benchmark["num_prompts_per_length"])
         for batch_size, new_tokens in product(benchmark["batch_sizes"], benchmark["new_tokens"]):
             case = {
-                "variant": "baseline",
+                "variant": variant,
                 "batch_size_requested": batch_size,
                 "prompt_length": length,
                 "new_tokens": new_tokens,
@@ -132,8 +142,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("demo", help="Run the INT8 matrix exercise offline on CPU.")
-    run = commands.add_parser("run", help="Evaluate and benchmark the floating-point model.")
+    run = commands.add_parser("run", help="Evaluate and benchmark the baseline or INT8 model.")
     run.add_argument("--config", type=Path, required=True)
+    run.add_argument("--variant", choices=("baseline", "int8_per_tensor"), default="baseline")
     run.add_argument("--output", type=Path, default=Path("results"))
     run.add_argument("--device", choices=("cpu", "cuda"))
     run.add_argument("--dtype", choices=("float32", "float16", "bfloat16"))
@@ -146,6 +157,7 @@ def main():
         return
 
     config = json.loads(args.config.read_text(encoding="utf-8"))
+    config["variant"] = args.variant
     if args.device:
         config["model"]["device"] = args.device
     if args.dtype:

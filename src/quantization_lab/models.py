@@ -5,6 +5,8 @@ from itertools import chain
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from .quantizers.int8 import NaiveInt8Linear
+
 
 def load_model(config):
     device = torch.device(config["device"])
@@ -31,6 +33,24 @@ def load_model(config):
     revision = getattr(model.config, "_commit_hash", None) or config["revision"]
     tokenizer = AutoTokenizer.from_pretrained(config["id"], revision=revision)
     return model, tokenizer
+
+
+def quantize_model_int8(model):
+    """Replace Qwen's Transformer linear layers in place; return their count.
+
+    Restricting the walk to the blocks leaves embeddings, the final norm, and
+    the output head outside the conversion. Norms inside blocks are not Linear
+    modules, so they are also preserved. Tied embedding/head weights stay tied.
+    """
+    converted = 0
+    for parent in model.model.layers.modules():
+        # Snapshot each parent's children before replacing any of them.
+        for name, child in list(parent.named_children()):
+            if isinstance(child, torch.nn.Linear):
+                setattr(parent, name, NaiveInt8Linear(child))
+                converted += 1
+    assert converted > 0, "No linear layers found. Start from the original Qwen checkpoint."
+    return converted
 
 
 def model_tensor_bytes(model):

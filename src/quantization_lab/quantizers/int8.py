@@ -16,13 +16,16 @@ def quantize_int8(weight):
         scale = torch.ones_like(scale)
     # Round to the nearest code, clamp to the chosen symmetric range, then store.
     qweight = torch.round(values / scale).clamp(-127, 127).to(torch.int8)
-    assert scale > 0 and qweight.dtype == torch.int8
+    assert torch.isfinite(scale) and scale > 0, "Quantization needs a finite, positive scale."
+    assert qweight.dtype == torch.int8
     return qweight, scale
 
 
 def dequantize_int8(qweight, scale):
+    # Values were checked during quantization. These metadata checks do not
+    # synchronize the GPU on every forward, unlike checking a tensor's contents.
     assert qweight.dtype == torch.int8
-    assert scale.numel() == 1 and torch.isfinite(scale).all() and scale > 0
+    assert scale.numel() == 1 and scale.dtype == torch.float32
     return qweight.float() * scale
 
 
@@ -43,6 +46,7 @@ class NaiveInt8Linear(nn.Module):
         self.register_buffer("scale", scale)
         bias = linear.bias.detach().clone() if linear.bias is not None else None
         self.register_buffer("bias", bias)
+        self.train(linear.training)
 
     def forward(self, x):
         assert x.shape[-1] == self.in_features
