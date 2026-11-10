@@ -6,8 +6,9 @@ what changes.
 The current milestone compares the floating-point Qwen2.5-0.5B baseline with
 per-tensor INT8, per-output-channel INT8, and unpacked INT4 with either per-channel
 scales or fixed groups of 128. Packed group-128 INT4 stores the same codes in half
-as many bytes. A standalone matrix exercise explains the arithmetic first. There
-are no advanced quantization methods or serving frameworks yet.
+as many bytes. A standalone matrix exercise explains the arithmetic first.
+One optimized TorchAO group-128 INT4 variant provides a practical reference;
+all variants use the same evaluation and benchmark runner.
 
 ## Setup: NVIDIA GPU through WSL/Linux
 
@@ -20,11 +21,11 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 ```
 
-Install a CUDA-enabled PyTorch build using the command for your machine from
-[PyTorch's installation page](https://pytorch.org/get-started/locally/), then install
-this project:
+This milestone pins **PyTorch 2.9.1 and TorchAO 0.15.0** as a compatible pair.
+Install PyTorch's CUDA 12.8 build, then install this project:
 
 ```bash
+python -m pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
 python -m pip install -e .
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
@@ -32,14 +33,17 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 CUDA availability should print `True` before running the provided configs. They
 explicitly request BF16 on CUDA; the runner does not silently substitute CPU or a
 different precision. If BF16 is unavailable, select FP16 explicitly and keep that
-baseline dtype consistent across later comparisons.
+baseline dtype consistent across manual comparisons. The optimized TorchAO variant
+requires BF16 and an Ampere or newer NVIDIA GPU (SM80+), such as the RTX 3090.
 
 ## Setup: RunPod PyTorch image
 
 For a regular GPU Pod, use a RunPod PyTorch image with **Python 3.11+ and PyTorch
->=2.9,<3**. Older images may cause pip to replace their bundled PyTorch to satisfy
-this project's dependencies. Pick a compatible image and keep its exact tag and
-GPU type consistent across comparisons.
+2.9.1**, with CUDA 12.8 for this experiment. An installed `2.9.1+cu128` build
+satisfies the project pin and is kept by the normal install. Other PyTorch versions
+do not satisfy the pin and pip may replace them. Keep the exact image tag and GPU
+type consistent across comparisons. TorchAO and plotting are included in
+`python -m pip install -e .`.
 
 Put a checkout or copy of this repository at
 `/workspace/llm-inference-03-quantization`. Use the image's Python environment
@@ -171,12 +175,16 @@ python -m pip install -e .
 python -m quantization_lab compare --config configs/comparison.json
 ```
 
-This runs the baseline and all five quantized variants sequentially. Each gets a
+This runs the baseline and all six quantized variants sequentially. Each gets a
 fresh Python process, so the previous model and its CUDA allocations are released
 before the next variant loads. `--device`, `--dtype`, and `--output` work as they
 do for `run`. After all variants finish, the command automatically generates the
-four comparison charts. Matplotlib is included in the standard installation, and
-plotting support is checked before starting any experiments.
+four comparison charts. Plotting support is checked first. A separate child process
+then checks TorchAO's packed kernels on all four unique Qwen projection shapes,
+with prefill and single-token inputs. This happens before downloading weights or
+starting any measured experiment. Unsupported setups stop with an error. The full
+comparison therefore requires CUDA and BF16; individual manual variants and the
+numerical demo remain available on CPU.
 
 Everything goes under one folder:
 
@@ -195,6 +203,7 @@ results/<UTC timestamp>-comparison/
   <UTC timestamp>-int4_per_channel_unpacked/
   <UTC timestamp>-int4_group128_unpacked/
   <UTC timestamp>-int4_group128_packed/
+  <UTC timestamp>-torchao_int4_group128/
 ```
 
 Open `comparison.csv` for the combined view. Each row includes the variant,
@@ -209,6 +218,47 @@ The comparison is updated after each completed variant. Configuration, software,
 hardware, resolved model revision, and token-sample metadata must match before a
 run's rows are added. An OOM benchmark case retains its status and empty timing
 fields. A failed run stops the command and leaves the completed results available.
+
+## Optimized group-128 INT4 reference
+
+To run only the optimized variant:
+
+```bash
+python -m quantization_lab run --config configs/comparison.json --variant torchao_int4_group128
+```
+
+The adapter uses TorchAO 0.15.0's `Int4WeightOnlyConfig` version 2, group size 128,
+`TILE_PACKED_TO_4D` format, and `TINYGEMM` quantization parameters. It converts the
+same 168 Transformer projections as the manual variants, preserving embeddings,
+normalization, biases, the output head, and weight sharing. It uses the packed
+`aten::_weight_int4pack_mm` operation with BF16 activations in eager execution.
+It needs no calibration text or model compilation.
+
+TorchAO's format differs from our manual symmetric `[-7, 7]` format: it uses
+asymmetric codes in `[0, 15]`, BF16 scales and offsets, and kernel padding. Input
+widths 896 and 4,864 are padded to 1,024 and 5,120; logical layer shapes are
+preserved. Storage accounting visits the wrapper's physical code and qparam
+tensors, including padded entries, rather than counting its logical BF16 shape.
+This compares complete implementations, including their numerical choices.
+
+Before evaluation, the optimized run profiles a short prefill and cached decode
+outside benchmark timing. It requires one packed operation per converted
+projection per forward, finite logits, and a working cache. `environment.json`
+records the TorchAO version, packing recipe, padding, and verified operator count
+under `quantization.kernel_check`. It also records `execution: "eager"` for all
+variants. Smaller storage or faster execution is measured, not assumed.
+
+You can run the initial shape check alone without downloading the model:
+
+```bash
+python -m quantization_lab.quantizers.torchao_int4 configs/comparison.json
+```
+
+The first comparison to review is BF16 versus manual packed group-128 INT4 versus
+TorchAO group-128 INT4, using the existing comparison preset and its plots.
+
+See the [TorchAO compatibility table](https://github.com/pytorch/ao/issues/2919)
+and the [pinned packed-kernel implementation](https://github.com/pytorch/ao/blob/v0.15.0/torchao/quantization/quantize_/workflows/int4/int4_tile_packed_to_4d_tensor.py).
 
 The first run downloads Qwen2.5-0.5B and WikiText-2 through Hugging Face. Later runs
 can use its cache. A CPU check is possible with explicit overrides, although the
@@ -281,15 +331,21 @@ Windowing is deliberately fixed; see the
 [Transformers perplexity guide](https://huggingface.co/docs/transformers/en/perplexity)
 for why the context policy matters.
 
-Both configs initially use `main` revisions. Before a milestone comparison, replace
-the model revision with the resolved commit in `environment.json` and pin the
-dataset revision to a Hugging Face commit as well. Keep that config unchanged for
-all variants. The saved token hash lets you detect accidental input changes.
+Both configs initially use `main` revisions. A comparison resolves the model
+config's Hub cache path to an exact commit in the baseline child, then saves that
+commit in its shared config for subsequent variants. Each run loads the model and
+tokenizer from the same commit and records it in `environment.json`, including when Transformers leaves its own
+`_commit_hash` unset. Individual runs also resolve and save their model revision.
+Local model directories have no Hub commit. Before a milestone comparison, pin
+the dataset revision to a Hugging Face commit as well. The saved token hash and
+fingerprint check that every variant receives identical evaluation inputs.
 
 ## Measurement definitions
 
 - **Persistent model tensor bytes:** unique parameter and buffer storage, including
-  shared embeddings only once. This excludes the KV cache and is not file size.
+  shared embeddings only once. Quantized tensor wrappers contribute their physical
+  packed codes and qparams, including padding. This excludes the KV cache and is
+  not file size.
 - **Peak GPU allocated bytes:** PyTorch's peak allocation for each measured batch,
   reset after warmup. Includes resident model tensors, inputs, KV cache, and
   temporary tensors. Excludes allocator-reserved slack and non-PyTorch allocations.
@@ -328,7 +384,7 @@ summary.csv           one row per workload case
 times generation; `results.py` writes plain files. `cli.py` connects those functions
 with a straightforward loop.
 
-Twelve focused tests use generated tensors and a tiny randomly initialized Qwen
+Fourteen focused tests use generated tensors and randomly initialized Qwen
 model. Numerical examples check rounding, scales, and zero rows at both precisions.
 One group-128 numerical test covers multiple groups, rounding, and a zero group.
 One packing test checks known bytes and exact recovery of every emitted INT4 code.
@@ -339,6 +395,10 @@ exactly half the code bytes. It also checks that per-channel INT4 and INT8 use t
 same bytes and grouping adds scales.
 One plotting preparation test checks quality deduplication, workload separation,
 and preservation of OOM or unavailable measurements. It does not render images.
+One TorchAO storage test checks actual wrapper fields, padding, and shared views
+on CPU. One CUDA integration test uses a single Qwen block with the real projection
+widths, checks preserved layers and biases, and verifies packed dispatch during
+prefill and cached decode. This test is skipped when CUDA is unavailable.
 Tests download no weights or data; their timings and perplexities are not
 model-quality or GPU-performance results.
 

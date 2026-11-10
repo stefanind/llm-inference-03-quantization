@@ -1,11 +1,24 @@
 """Model loading and the storage that stays resident between forward calls."""
 
 from itertools import chain
+from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.utils.hub import cached_file, extract_commit_hash
 
 from .quantizers.symmetric import NaiveQuantizedLinear
+
+
+def resolve_model_revision(config):
+    """Pin a Hub revision using its cached config path, even when Transformers drops _commit_hash."""
+    config_path = cached_file(config["id"], "config.json", revision=config["revision"])
+    revision = extract_commit_hash(config_path, None)
+    if revision is None and not Path(config["id"]).is_dir():
+        raise RuntimeError("Could not resolve the model's commit. Use an exact Hugging Face commit revision.")
+    if revision is not None:
+        config["revision"] = revision
+    return revision
 
 
 def load_model(config):
@@ -21,6 +34,7 @@ def load_model(config):
         if dtype_name == "bfloat16" and not torch.cuda.is_bf16_supported():
             raise RuntimeError("This GPU does not support BF16. Choose float16 explicitly.")
 
+    revision = resolve_model_revision(config)
     model = AutoModelForCausalLM.from_pretrained(
         config["id"],
         revision=config["revision"],
@@ -29,9 +43,10 @@ def load_model(config):
     )
     model.to(device).eval()
 
-    # Use the model's resolved commit for the tokenizer too, even if revision was main.
-    revision = getattr(model.config, "_commit_hash", None) or config["revision"]
-    tokenizer = AutoTokenizer.from_pretrained(config["id"], revision=revision)
+    # Record our resolved commit explicitly and load the tokenizer from the same one.
+    # Local fixture directories have no Hub commit and intentionally retain None.
+    model.config._commit_hash = revision
+    tokenizer = AutoTokenizer.from_pretrained(config["id"], revision=config["revision"])
     return model, tokenizer
 
 
@@ -65,7 +80,15 @@ def model_tensor_bytes(model):
     """
     seen = set()
     total = 0
-    for tensor in chain(model.parameters(), model.buffers()):
+    tensors = list(chain(model.parameters(), model.buffers()))
+    while tensors:
+        tensor = tensors.pop()
+        if hasattr(tensor, "__tensor_flatten__"):
+            # A quantized wrapper's logical BF16 shape is not its physical storage.
+            # Visit its actual packed codes and qparams, including any padded entries.
+            names, _ = tensor.__tensor_flatten__()
+            tensors.extend(getattr(tensor, name) for name in names)
+            continue
         storage = tensor.untyped_storage()
         key = (tensor.device, storage.data_ptr())
         if key not in seen:

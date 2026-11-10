@@ -16,6 +16,7 @@ VARIANTS = (
     "int4_per_channel_unpacked",
     "int4_group128_unpacked",
     "int4_group128_packed",
+    "torchao_int4_group128",
 )
 
 
@@ -60,6 +61,10 @@ def run_experiment(config, output_root):
 
     validate_config(config)
     variant = config.get("variant", "baseline")
+    if variant == "torchao_int4_group128":
+        from .quantizers.torchao_int4 import check_support
+
+        check_support(config["model"])
     torch.manual_seed(config["seed"])
     # Every run starts from the original weights, never a previously quantized model.
     print("Loading the original floating-point checkpoint...", flush=True)
@@ -73,7 +78,13 @@ def run_experiment(config, output_root):
         raise ValueError("Evaluation context length exceeds the model context limit.")
 
     converted_layers = 0
-    if variant != "baseline":
+    quantization = None
+    if variant == "torchao_int4_group128":
+        from .quantizers.torchao_int4 import quantize_model, recipe_metadata, verify_kernel
+
+        converted_layers = quantize_model(model)
+        quantization = {**recipe_metadata(model), "kernel_check": verify_kernel(model, converted_layers)}
+    elif variant != "baseline":
         bits = 8 if variant in ("int8_per_tensor", "int8_per_channel") else 4
         per_channel = variant in ("int8_per_channel", "int4_per_channel_unpacked")
         grouped = variant in ("int4_group128_unpacked", "int4_group128_packed")
@@ -81,6 +92,7 @@ def run_experiment(config, output_root):
         converted_layers = quantize_model_weights(
             model, bits=bits, per_channel=per_channel, grouped=grouped, packed=packed
         )
+    if converted_layers:
         print(f"Converted {converted_layers} Transformer linear layers: {variant}.", flush=True)
 
     token_budget = max(
@@ -102,6 +114,9 @@ def run_experiment(config, output_root):
         "python": platform.python_version(),
         "platform": platform.platform(),
         "torch": torch.__version__,
+        "torchao": version("torchao"),
+        "execution": "eager",
+        "quantization": quantization,
         "transformers": version("transformers"),
         "datasets": version("datasets"),
         "cuda_runtime": torch.version.cuda,
@@ -172,6 +187,12 @@ def run_comparison(config, output_root):
     config_path = comparison_dir / "config.json"
     write_json(config_path, config)
 
+    # This child releases its CUDA context before any experiment is measured.
+    # In particular, a missing/unsupported backend must not waste six earlier runs.
+    print("Checking the optimized INT4 backend...", flush=True)
+    subprocess.run([
+        sys.executable, "-m", "quantization_lab.quantizers.torchao_int4", str(config_path),
+    ], check=True)
     run_dirs = []
     for variant in VARIANTS:
         print(f"\nRunning {variant} ({len(run_dirs) + 1}/{len(VARIANTS)})...", flush=True)
@@ -182,6 +203,12 @@ def run_comparison(config, output_root):
             "--output", str(comparison_dir),
         ], check=True)
         run_dir, = comparison_dir.glob(f"*-{variant}")
+        if variant == "baseline":
+            # The baseline resolved its commit before loading weights. Reuse it in
+            # every child without importing model/CUDA libraries into this parent.
+            baseline_config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+            config["model"]["revision"] = baseline_config["model"]["revision"]
+            write_json(config_path, config)
         run_dirs.append(run_dir)
         # Save progress after every completed variant, including the baseline.
         write_comparison(comparison_dir / "comparison.csv", run_dirs)

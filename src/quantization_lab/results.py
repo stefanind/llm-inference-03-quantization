@@ -57,6 +57,7 @@ def write_comparison(path, run_dirs):
             "python", "torch", "transformers", "datasets", "cuda_runtime",
             "device", "device_name", "dtype", "attention_implementation",
             "model_resolved_revision", "tokenizer_class",
+            "torchao", "execution",
         )
         signature = (
             config, {key: environment[key] for key in environment_keys},

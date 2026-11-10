@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "Small, readable experiments in LLM weight quantization"
 requires-python = ">=3.11"
 dependencies = [
-    "torch>=2.9,<3",
+    "torch==2.9.1",
+    "torchao==0.15.0",
     "transformers>=5.10,<6",
     "datasets>=5,<6",
     "matplotlib>=3.9,<4",
