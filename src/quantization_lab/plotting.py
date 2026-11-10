@@ -13,6 +13,7 @@ STYLES = {
     "int4_per_channel_unpacked": ("INT4 / channel (unpacked)", "#d97706"),
     "int4_group128_unpacked": ("INT4 / group128 (unpacked)", "#7c3aed"),
     "int4_group128_packed": ("INT4 / group128 (packed)", "#db2777"),
+    "gptq_int4_group128_packed": ("GPTQ INT4 / group128 (packed)", "#65a30d"),
     "torchao_int4_group128": ("TorchAO INT4 / group128", "#0891b2"),
 }
 WORKLOAD_METRICS = ("mean_prefill_ms", "decode_tokens_per_second", "peak_gpu_allocated_bytes")

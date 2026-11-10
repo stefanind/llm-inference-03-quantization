@@ -12,6 +12,11 @@
     "split": "test",
     "revision": "main"
   },
+  "calibration": {
+    "split": "train",
+    "num_sequences": 128,
+    "sequence_length": 512
+  },
   "evaluation": {
     "max_tokens": 8192,
     "context_length": 512,

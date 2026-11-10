@@ -8,7 +8,8 @@ per-tensor INT8, per-output-channel INT8, and unpacked INT4 with either per-chan
 scales or fixed groups of 128. Packed group-128 INT4 stores the same codes in half
 as many bytes. A standalone matrix exercise explains the arithmetic first.
 One optimized TorchAO group-128 INT4 variant provides a practical reference;
-all variants use the same evaluation and benchmark runner.
+GPTQ uses calibration text to compensate rounding error in the manual packed
+format. All variants use the same evaluation and benchmark runner.
 
 ## Setup: NVIDIA GPU through WSL/Linux
 
@@ -149,7 +150,7 @@ Only group size 128 is supported; there is no group-size argument or sweep.
 Qwen2.5-0.5B's relevant input widths, 896 and 4,864, divide evenly by 128. A
 divisibility assertion keeps the code simple, with no padding or partial groups.
 
-All variants reconstruct weights in the input dtype before calling `F.linear`.
+All manual variants reconstruct weights in the input dtype before calling `F.linear`.
 Unpacked INT4 keeps `qweight` as `torch.int8`. Per-channel INT4 therefore matches
 per-channel INT8 storage, while group-128 INT4 adds more scales. Packing halves
 the code bytes, not the scales or unconverted layers. This iteration measures the
@@ -175,7 +176,7 @@ python -m pip install -e .
 python -m quantization_lab compare --config configs/comparison.json
 ```
 
-This runs the baseline and all six quantized variants sequentially. Each gets a
+This runs the baseline and all seven quantized variants sequentially. Each gets a
 fresh Python process, so the previous model and its CUDA allocations are released
 before the next variant loads. `--device`, `--dtype`, and `--output` work as they
 do for `run`. After all variants finish, the command automatically generates the
@@ -203,6 +204,7 @@ results/<UTC timestamp>-comparison/
   <UTC timestamp>-int4_per_channel_unpacked/
   <UTC timestamp>-int4_group128_unpacked/
   <UTC timestamp>-int4_group128_packed/
+  <UTC timestamp>-gptq_int4_group128_packed/
   <UTC timestamp>-torchao_int4_group128/
 ```
 
@@ -281,6 +283,67 @@ Each case has one warmup per batch shape and three measured passes over its prom
 smoke preset during development and the comparison preset at milestones. Small
 sample counts are useful engineering checks, not precise tail-latency estimates.
 
+## GPTQ with fixed group-128 scales
+
+```bash
+python -m quantization_lab run --config configs/smoke.json --variant gptq_int4_group128_packed
+python -m quantization_lab compare --config configs/comparison.json
+```
+
+The question is whether calibration reduces the quality loss at the same storage
+budget. Compare BF16, `int4_group128_packed` (ordinary rounding), and
+`gptq_int4_group128_packed`. GPTQ changes code selection, using the same symmetric
+`[-7, 7]` range, **exact same scales computed from the original weights**, FP32
+scale storage, and INT4 packing. Only Qwen's block projections are converted.
+
+Both presets contain one fixed calibration setup:
+
+```json
+"calibration": {
+  "split": "train",
+  "num_sequences": 128,
+  "sequence_length": 512
+}
+```
+
+The loader uses the existing WikiText-2 dataset settings with the `train` split.
+It joins rows with two newlines, tokenizes without special tokens, drops the
+partial tail, and samples 128 distinct 512-token chunks without replacement using
+seed 0. The chunks cannot overlap. These 65,536 calibration tokens are separate
+from the test sample used for perplexity and timing. No labels, generated text,
+validation split, or optimizer are needed. The smoke preset uses this same
+calibration sample; it reduces only evaluation and benchmark work.
+
+Read [gptq.py](src/quantization_lab/quantizers/gptq.py) for the algorithm. Each
+projection accumulates the mean `X.T @ X` of its input activations in FP32. A
+diagonal damping term of 1% of the mean diagonal stabilizes Cholesky factorization;
+channels never observed in calibration receive a safe diagonal and zero weights.
+Scales remain those of the original weights, including any unseen channels.
+Columns are quantized in their original order. Each column's rounding error is
+used to compensate the remaining columns, with updates grouped into blocks of
+128 for efficient matrix multiplication. There is no activation-order permutation
+or parameter sweep. This is the static-group GPTQ recipe, based on the
+[authors' implementation](https://github.com/IST-DASLab/gptq/blob/main/gptq.py).
+
+Calibration processes one sequence at a time and one Transformer block at a time.
+Statistics for all seven projections are collected before replacing any in that
+block. After conversion, the block is run again and its quantized outputs become
+the next block's inputs. Temporary statistics and the hidden-state cache are
+released before evaluation and inference measurements.
+
+GPTQ's codes enter `NaiveQuantizedLinear` directly, without rounding a second time.
+It has exactly the same persistent storage size and reconstructs weights on every
+forward like manual packed INT4. TorchAO remains the optimized execution reference;
+it uses a different numerical format, so its quality difference does not isolate
+GPTQ's effect. A lower perplexity is measured, not guaranteed. The fixed calibration
+budget is a starting point for this corpus and 512-token context, not a reproduction
+of the paper's experiments or a claim about long-context, chat, or code quality.
+
+`environment.json` records the recipe under `quantization` and calibration source,
+fingerprint, seed, chunk offsets, dimensions, and token hash under `calibration`.
+Other variants do not load calibration text. Calibration and statistics are outside
+inference timing and peak-allocation measurements. No additional package is needed.
+
 ## Plot a completed comparison
 
 `compare` creates the plots automatically. To regenerate them for an existing
@@ -312,8 +375,9 @@ the plot command regenerates the four images from the current reports.
 
 ## Data and evaluation policy
 
-We use **one fixed sample**, not separate training, validation, and calibration
-datasets. No text is needed to choose the initial min/max weight scales.
+All variants use **one fixed test sample** for evaluation and benchmark inputs.
+GPTQ additionally uses a fixed training-text calibration sample, described above.
+The other variants need no text to choose their weight quantization parameters.
 
 - Source: [`Salesforce/wikitext`, `wikitext-2-raw-v1`](https://huggingface.co/datasets/Salesforce/wikitext), test split.
 - Join rows in corpus order with two newlines; add no special tokens.
@@ -384,15 +448,19 @@ summary.csv           one row per workload case
 times generation; `results.py` writes plain files. `cli.py` connects those functions
 with a straightforward loop.
 
-Fourteen focused tests use generated tensors and randomly initialized Qwen
-model. Numerical examples check rounding, scales, and zero rows at both precisions.
+Fifteen focused tests use generated tensors and randomly initialized Qwen
+models. Numerical examples check rounding, scales, and zero rows at both precisions.
 One group-128 numerical test covers multiple groups, rounding, and a zero group.
 One packing test checks known bytes and exact recovery of every emitted INT4 code.
-The conversion integration test runs all five quantized variants, checks preserved
-layers and tied weights, and exercises cached decoding. It verifies that packing
+The conversion integration test runs the five rounding variants and GPTQ on a
+two-block model, checks preserved layers, biases, and tied weights, and exercises
+cached decoding. It verifies that packing
 preserves prefill and decode outputs from the same original weights and saves
 exactly half the code bytes. It also checks that per-channel INT4 and INT8 use the
-same bytes and grouping adds scales.
+same bytes and grouping adds scales. GPTQ has the exact same scales and persistent
+storage size as packed rounding. Its calibration sampler is checked for repeatable,
+distinct training chunks. One hand-checkable GPTQ example covers compensation
+across group boundaries, unseen input channels, and a zero row.
 One plotting preparation test checks quality deduplication, workload separation,
 and preservation of OOM or unavailable measurements. It does not render images.
 One TorchAO storage test checks actual wrapper fields, padding, and shared views

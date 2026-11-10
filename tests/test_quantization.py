@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -6,6 +7,8 @@ from torch.nn import functional as F
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
 from quantization_lab.models import model_tensor_bytes, quantize_model_weights
+from quantization_lab.data import load_calibration_tokens
+from quantization_lab.quantizers.gptq import quantize_model as quantize_model_gptq, quantize_weight_gptq
 from quantization_lab.quantizers.packing import pack_int4, unpack_int4
 from quantization_lab.quantizers.symmetric import (
     NaiveQuantizedLinear,
@@ -102,41 +105,93 @@ class QuantizationTests(unittest.TestCase):
         model.register_buffer("codes", torch.tensor([1, 2], dtype=torch.int8))
         self.assertEqual(model_tensor_bytes(model), 5 * 4 * 4 + 2)
 
+    def test_gptq_compensates_error_across_groups(self):
+        # Both active channels always have the same input. Rounding 0.4 + 0.4
+        # independently gives 0; compensating the second group produces 0 + 1.
+        weight = torch.zeros(2, 256)
+        weight[0, [0, 128]] = 0.4
+        weight[0, [127, 255]] = 7  # Fix each group's scale at 1; these inputs are unseen.
+        inputs = torch.zeros(2, 256)
+        inputs[0, [0, 128]] = 1
+        inputs[1, [0, 128]] = -1
+        moment = inputs.T @ inputs / len(inputs)
+
+        codes, scale = quantize_weight_gptq(weight, moment)
+        expected = torch.zeros_like(codes)
+        expected[0, 128] = 1
+        torch.testing.assert_close(codes, expected)
+        torch.testing.assert_close(scale, torch.ones(2, 2, 1))
+        rounded, rounded_scale = quantize_weight(weight, bits=4, grouped=True)
+        original = F.linear(inputs, weight)
+        gptq_error = (F.linear(inputs, dequantize_weight(codes, scale)) - original).square().mean()
+        rounding_error = (F.linear(inputs, dequantize_weight(rounded, rounded_scale)) - original).square().mean()
+        self.assertLess(gptq_error.item(), rounding_error.item())
+
     def test_qwen_conversion_preserves_excluded_layers_and_cached_decoding(self):
         config = Qwen2Config(
             vocab_size=32, hidden_size=128, intermediate_size=256,
-            num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1,
+            num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
             max_position_embeddings=64, tie_word_embeddings=True,
             attn_implementation="sdpa",
         )
         # Use identical original weights so packing's effect can be isolated.
         initial_state = Qwen2ForCausalLM(config).state_dict()
+        # Exercise the actual sampler without downloading a corpus. Calibration
+        # always overrides the evaluation split with train, and repeats exactly.
+        dataset_config = {"id": "fixture", "subset": "text", "split": "test", "revision": "main"}
+        calibration_config = {"split": "train", "num_sequences": 2, "sequence_length": 8}
+        tokenizer = object()
+        with patch("quantization_lab.data.load_corpus", return_value=(list(range(32)), "fixture")) as corpus:
+            calibration, metadata = load_calibration_tokens(dataset_config, tokenizer, calibration_config, seed=0)
+            repeated, repeated_metadata = load_calibration_tokens(dataset_config, tokenizer, calibration_config, seed=0)
+            corpus.assert_called_with({**dataset_config, "split": "train"}, tokenizer)
+        torch.testing.assert_close(calibration, repeated)
+        self.assertEqual(metadata, repeated_metadata)
+        self.assertEqual(len(set(metadata["token_offsets"])), 2)
+        self.assertEqual(metadata["num_tokens"], 16)
         storage_bytes = {}
         outputs = {}
         modes = (
             (8, False, False, False), (8, True, False, False),
             (4, True, False, False), (4, False, True, False), (4, False, True, True),
         )
-        for mode in modes:
-            bits, per_channel, grouped, packed = mode
+        packed_scales = {}
+        for mode in (*modes, "gptq"):
+            bits, per_channel, grouped, packed = (4, False, True, True) if mode == "gptq" else mode
             with self.subTest(mode=mode):
                 model = Qwen2ForCausalLM(config).eval()
                 model.load_state_dict(initial_state)
                 embeddings = model.model.embed_tokens
                 head = model.lm_head
-                norm_weights = {
+                preserved_weights = {
                     name: weight.detach().clone()
-                    for name, weight in model.named_parameters() if "norm" in name
+                    for name, weight in model.named_parameters() if "norm" in name or name.endswith(".bias")
                 }
                 original_bytes = model_tensor_bytes(model)
 
-                # One block has four attention projections and three MLP projections.
-                count = quantize_model_weights(
-                    model, bits=bits, per_channel=per_channel, grouped=grouped, packed=packed
-                )
-                self.assertEqual(count, 7)
+                if mode == "gptq":
+                    second_block_inputs = []
+                    handle = model.model.layers[1].register_forward_pre_hook(
+                        lambda module, args: second_block_inputs.append(args[0].clone())
+                    )
+                    try:
+                        count = quantize_model_gptq(model, calibration)
+                        with torch.inference_mode():
+                            model.model(input_ids=calibration[:1], use_cache=False)
+                    finally:
+                        handle.remove()
+                    # The initial setup probe saw the original model. The next
+                    # call collected statistics after block 1 was quantized;
+                    # replaying the finished model must give that same input.
+                    torch.testing.assert_close(second_block_inputs[1], second_block_inputs[-1], rtol=0, atol=0)
+                else:
+                    count = quantize_model_weights(
+                        model, bits=bits, per_channel=per_channel, grouped=grouped, packed=packed
+                    )
+                # Each block has four attention projections and three MLP projections.
+                self.assertEqual(count, 14)
                 converted = [m for m in model.model.layers.modules() if isinstance(m, NaiveQuantizedLinear)]
-                self.assertEqual(len(converted), 7)
+                self.assertEqual(len(converted), 14)
                 self.assertFalse(any(isinstance(m, nn.Linear) for m in model.model.layers.modules()))
                 for layer in converted:
                     self.assertEqual(layer.qweight.dtype, torch.uint8 if packed else torch.int8)
@@ -153,8 +208,14 @@ class QuantizationTests(unittest.TestCase):
                 self.assertIs(model.model.embed_tokens, embeddings)
                 self.assertIs(model.lm_head, head)
                 self.assertIs(model.lm_head.weight, model.model.embed_tokens.weight)
-                for name, expected in norm_weights.items():
-                    torch.testing.assert_close(model.get_parameter(name), expected)
+                for name, expected in preserved_weights.items():
+                    torch.testing.assert_close(model.state_dict()[name], expected)
+                for name, layer in model.named_modules():
+                    if isinstance(layer, NaiveQuantizedLinear) and grouped and packed:
+                        if mode == "gptq":
+                            torch.testing.assert_close(layer.scale, packed_scales[name], rtol=0, atol=0)
+                        else:
+                            packed_scales[name] = layer.scale.clone()
                 storage_bytes[mode] = model_tensor_bytes(model)
                 self.assertLess(storage_bytes[mode], original_bytes)
                 if grouped and not packed:
@@ -180,6 +241,7 @@ class QuantizationTests(unittest.TestCase):
         # Only code storage halves. Scales and all unconverted tensors stay the same.
         self.assertEqual(storage_bytes[packed], storage_bytes[unpacked] - unpacked_code_bytes // 2)
         torch.testing.assert_close(outputs[packed], outputs[unpacked], rtol=0, atol=0)
+        self.assertEqual(storage_bytes["gptq"], storage_bytes[packed])
 
 
 if __name__ == "__main__":

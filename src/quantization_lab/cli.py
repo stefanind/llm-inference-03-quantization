@@ -16,6 +16,7 @@ VARIANTS = (
     "int4_per_channel_unpacked",
     "int4_group128_unpacked",
     "int4_group128_packed",
+    "gptq_int4_group128_packed",
     "torchao_int4_group128",
 )
 
@@ -24,6 +25,17 @@ def validate_config(config):
     """Reject invalid user settings before downloading a model or dataset."""
     if config.get("variant", "baseline") not in VARIANTS:
         raise ValueError(f"variant must be one of: {', '.join(VARIANTS)}.")
+    calibration = config.get("calibration")
+    if config.get("variant") == "gptq_int4_group128_packed" and calibration is None:
+        raise ValueError("GPTQ requires a calibration section in the config.")
+    if calibration is not None:
+        if calibration["split"] != "train":
+            raise ValueError("Calibration must use the training split.")
+        if config["dataset"]["split"] == "train":
+            raise ValueError("Evaluation must use a separate split from calibration.")
+        for name in ("num_sequences", "sequence_length"):
+            if type(calibration[name]) is not int or calibration[name] < 1:
+                raise ValueError(f"calibration.{name} must be a positive integer.")
     evaluation = config["evaluation"]
     benchmark = config["benchmark"]
     for name in ("max_tokens", "context_length", "stride"):
@@ -79,11 +91,30 @@ def run_experiment(config, output_root):
 
     converted_layers = 0
     quantization = None
+    calibration_metadata = None
     if variant == "torchao_int4_group128":
         from .quantizers.torchao_int4 import quantize_model, recipe_metadata, verify_kernel
 
         converted_layers = quantize_model(model)
         quantization = {**recipe_metadata(model), "kernel_check": verify_kernel(model, converted_layers)}
+    elif variant == "gptq_int4_group128_packed":
+        from .data import load_calibration_tokens
+        from .quantizers.gptq import DAMPING, quantize_model
+
+        if config["calibration"]["sequence_length"] > context_limit:
+            raise ValueError("Calibration sequence length exceeds the model context limit.")
+        print("Preparing the fixed training-text calibration sample...", flush=True)
+        calibration_tokens, calibration_metadata = load_calibration_tokens(
+            config["dataset"], tokenizer, config["calibration"], config["seed"]
+        )
+        converted_layers = quantize_model(model, calibration_tokens)
+        del calibration_tokens
+        quantization = {
+            "method": "gptq", "bits": 4, "group_size": 128,
+            "mapping": "symmetric", "code_range": [-7, 7],
+            "scale_dtype": "torch.float32", "packed": True,
+            "static_groups": True, "activation_order": False, "damping": DAMPING,
+        }
     elif variant != "baseline":
         bits = 8 if variant in ("int8_per_tensor", "int8_per_channel") else 4
         per_channel = variant in ("int8_per_channel", "int4_per_channel_unpacked")
@@ -117,6 +148,7 @@ def run_experiment(config, output_root):
         "torchao": version("torchao"),
         "execution": "eager",
         "quantization": quantization,
+        "calibration": calibration_metadata,
         "transformers": version("transformers"),
         "datasets": version("datasets"),
         "cuda_runtime": torch.version.cuda,
@@ -179,6 +211,8 @@ def run_comparison(config, output_root):
 
     config = {**config, "variant": "baseline"}
     validate_config(config)
+    # Check the calibrated variant's required settings before starting any child.
+    validate_config({**config, "variant": "gptq_int4_group128_packed"})
     # Check plotting support before starting any GPU work.
     load_pyplot()
     comparison_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-comparison"
@@ -188,7 +222,7 @@ def run_comparison(config, output_root):
     write_json(config_path, config)
 
     # This child releases its CUDA context before any experiment is measured.
-    # In particular, a missing/unsupported backend must not waste six earlier runs.
+    # A missing/unsupported backend must not waste the earlier variants' runs.
     print("Checking the optimized INT4 backend...", flush=True)
     subprocess.run([
         sys.executable, "-m", "quantization_lab.quantizers.torchao_int4", str(config_path),

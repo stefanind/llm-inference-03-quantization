@@ -64,7 +64,7 @@ class NaiveQuantizedLinear(nn.Module):
     its codes, then uses the same reconstruction as the unpacked variants.
     """
 
-    def __init__(self, linear, bits=8, per_channel=False, grouped=False, packed=False):
+    def __init__(self, linear, bits=8, per_channel=False, grouped=False, packed=False, codes_and_scale=None):
         super().__init__()
         assert isinstance(linear, nn.Linear)
         assert not packed or bits == 4, "Packing requires four-bit codes."
@@ -72,9 +72,14 @@ class NaiveQuantizedLinear(nn.Module):
         self.out_features = linear.out_features
         self.bits = bits
         self.packed = packed
-        qweight, scale = quantize_weight(
-            linear.weight, bits=bits, per_channel=per_channel, grouped=grouped
-        )
+        if codes_and_scale is None:
+            qweight, scale = quantize_weight(
+                linear.weight, bits=bits, per_channel=per_channel, grouped=grouped
+            )
+        else:
+            # GPTQ has already chosen the codes. Store them without rounding again.
+            qweight, scale = codes_and_scale
+            assert qweight.dtype == torch.int8 and qweight.shape == linear.weight.shape
         # Keep only the packed buffer; the unpacked codes are temporary.
         if packed:
             qweight = pack_int4(qweight)
