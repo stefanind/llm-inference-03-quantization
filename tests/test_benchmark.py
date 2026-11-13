@@ -1,9 +1,13 @@
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 
 import torch
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
 from quantization_lab.benchmark import benchmark_case
+from quantization_lab.profiling import DECODE_STEPS, profile_decode
 from quantization_lab.results import summarize
 
 
@@ -54,6 +58,39 @@ class BenchmarkTests(unittest.TestCase):
         summary = summarize(records)
         self.assertAlmostEqual(summary["decode_tokens_per_second"], 200 / 11)
         self.assertEqual(summary["mean_prefill_ms"], 3)
+
+    def test_decode_trace_excludes_prefill_and_advances_cache(self):
+        config = Qwen2Config(
+            vocab_size=32, hidden_size=16, intermediate_size=32,
+            num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1,
+            max_position_embeddings=64, tie_word_embeddings=True,
+            attn_implementation="sdpa",
+        )
+        model = Qwen2ForCausalLM(config).eval()
+        cache_lengths = []
+
+        def inspect_cache(module, args, kwargs):
+            cache = kwargs.get("past_key_values")
+            cache_lengths.append(cache.get_seq_length() if cache is not None else 0)
+
+        scratch = Path(__file__).resolve().parents[1] / ".tmp"
+        scratch.mkdir(exist_ok=True)
+        handle = model.register_forward_pre_hook(inspect_cache, with_kwargs=True)
+        try:
+            with TemporaryDirectory(dir=scratch) as directory:
+                profile_decode(model, torch.tensor([[1, 2, 3, 4]]), directory)
+                events = json.loads((Path(directory) / "trace.json").read_text(encoding="utf-8"))["traceEvents"]
+                steps = [event for event in events if event.get("name") == "decode_step"]
+                self.assertEqual(len(steps), DECODE_STEPS)
+                # If prefill accidentally enters capture, an embedding input has
+                # shape [1, 4]. Every recorded model input must instead be [1, 1].
+                embeddings = [event for event in events if event.get("name") == "aten::embedding"]
+                self.assertEqual(len(embeddings), DECODE_STEPS)
+                self.assertTrue(all(event["args"]["Input Dims"][1] == [1, 1] for event in embeddings))
+                self.assertIn("self CPU time", (Path(directory) / "operators.txt").read_text(encoding="utf-8"))
+        finally:
+            handle.remove()
+        self.assertEqual(cache_lengths, [0] + list(range(4, 4 + DECODE_STEPS)))
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-"""A numerical demo, measured experiments, comparisons, and plots of saved results."""
+"""A numerical demo, quantization experiments, decode profiles, and comparison plots."""
 
 import argparse
 from datetime import datetime, timezone
@@ -60,7 +60,7 @@ def validate_config(config):
         raise ValueError("Each batch size needs at least that many prompts.")
 
 
-def run_experiment(config, output_root):
+def run_experiment(config, output_root, profiling=False):
     # Keep --help and config validation lightweight; load ML packages for a run.
     import gc
     import torch
@@ -73,6 +73,21 @@ def run_experiment(config, output_root):
 
     validate_config(config)
     variant = config.get("variant", "baseline")
+    if profiling:
+        from .profiling import DECODE_STEPS
+
+        benchmark = config["benchmark"]
+        if variant not in ("baseline", "torchao_int4_group128"):
+            raise ValueError("Profile baseline or torchao_int4_group128.")
+        if (
+            benchmark["batch_sizes"] != [1]
+            or benchmark["num_prompts_per_length"] != 1
+            or len(benchmark["prompt_lengths"]) != 1
+            or len(benchmark["new_tokens"]) != 1
+        ):
+            raise ValueError("Profile one workload and one prompt at batch 1. Use configs/profile.json.")
+        if benchmark["new_tokens"][0] <= DECODE_STEPS:
+            raise ValueError(f"Warmup generation must include at least {DECODE_STEPS} decode steps.")
     if variant == "torchao_int4_group128":
         from .quantizers.torchao_int4 import check_support
 
@@ -134,6 +149,8 @@ def run_experiment(config, output_root):
     tokens, dataset_metadata = load_tokens(config["dataset"], tokenizer, token_budget)
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + f"-{variant}"
+    if profiling:
+        run_id += "-profile"
     run_dir = Path(output_root) / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
     write_json(run_dir / "config.json", config)
@@ -163,12 +180,13 @@ def run_experiment(config, output_root):
     })
     print(f"Results: {run_dir}", flush=True)
 
-    quality = evaluate_perplexity(
-        model, tokens[:evaluation["max_tokens"]],
-        evaluation["context_length"], evaluation["stride"],
-    )
-    write_json(run_dir / "evaluation.json", quality)
-    print(f"Perplexity: {quality['perplexity']:.4f}", flush=True)
+    if not profiling:
+        quality = evaluate_perplexity(
+            model, tokens[:evaluation["max_tokens"]],
+            evaluation["context_length"], evaluation["stride"],
+        )
+        write_json(run_dir / "evaluation.json", quality)
+        print(f"Perplexity: {quality['perplexity']:.4f}", flush=True)
 
     summaries = []
     for length in benchmark["prompt_lengths"]:
@@ -198,6 +216,11 @@ def run_experiment(config, output_root):
             append_measurements(run_dir / "measurements.jsonl", [{**case, **r} for r in records])
             summaries.append({**case, **summary})
             write_summary(run_dir / "summary.csv", summaries)
+    if profiling:
+        from .profiling import profile_decode
+
+        profile_dir = profile_decode(model, prompts.to(device), run_dir / "profile")
+        print(f"Decode trace and operator summary: {profile_dir}", flush=True)
     return run_dir
 
 
@@ -259,10 +282,12 @@ def main():
     commands.add_parser("demo", help="Run the INT8 / INT4 exercise offline on CPU.")
     run = commands.add_parser("run", help="Evaluate and benchmark one model variant.")
     run.add_argument("--variant", choices=VARIANTS, default="baseline")
+    profile = commands.add_parser("profile", help="Benchmark one workload, then trace eight warmed decode steps.")
+    profile.add_argument("--variant", choices=("baseline", "torchao_int4_group128"), default="baseline")
     compare = commands.add_parser("compare", help="Run all variants and write a comparison CSV and plots.")
     plot = commands.add_parser("plot", help="Plot a saved comparison folder on CPU.")
     plot.add_argument("comparison_dir", type=Path)
-    for command in (run, compare):
+    for command in (run, compare, profile):
         command.add_argument("--config", type=Path, required=True)
         command.add_argument("--output", type=Path, default=Path("results"))
         command.add_argument("--device", choices=("cpu", "cuda"))
@@ -291,4 +316,4 @@ def main():
         run_comparison(config, args.output)
     else:
         config["variant"] = args.variant
-        run_experiment(config, args.output)
+        run_experiment(config, args.output, profiling=args.command == "profile")

@@ -1,0 +1,28 @@
+{
+  "seed": 0,
+  "model": {
+    "id": "Qwen/Qwen2.5-0.5B",
+    "revision": "060db6499f32faf8b98477b0a26969ef7d8b9987",
+    "device": "cuda",
+    "dtype": "bfloat16"
+  },
+  "dataset": {
+    "id": "Salesforce/wikitext",
+    "subset": "wikitext-2-raw-v1",
+    "split": "test",
+    "revision": "main"
+  },
+  "evaluation": {
+    "max_tokens": 65536,
+    "context_length": 512,
+    "stride": 256
+  },
+  "benchmark": {
+    "batch_sizes": [1],
+    "prompt_lengths": [128],
+    "new_tokens": [32],
+    "num_prompts_per_length": 1,
+    "warmup_batches": 2,
+    "repeats": 3
+  }
+}

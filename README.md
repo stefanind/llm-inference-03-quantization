@@ -283,6 +283,59 @@ Each case has one warmup per batch shape and three measured passes over its prom
 smoke preset during development and the comparison preset at milestones. Small
 sample counts are useful engineering checks, not precise tail-latency estimates.
 
+## Profile BF16 and TorchAO decoding
+
+Use the focused preset to investigate the decoding slowdown on the experiment GPU:
+
+```bash
+python -m quantization_lab profile --config configs/profile.json --variant baseline
+python -m quantization_lab profile --config configs/profile.json --variant torchao_int4_group128
+```
+
+Each command runs in its own process. The preset pins the model commit recorded
+by the TorchAO/GPTQ experiments and uses BF16, batch 1, a single 128-token prompt,
+and 32 generated tokens. Both variants receive the same first prompt from the
+65,536-token test prefix. The command loads the existing model and quantization
+paths, skips perplexity, then uses the ordinary benchmark for two warmup
+generations and three measured generations.
+
+After those measurements, it prepares a fresh 128-token KV cache outside the
+profiler and captures **eight single-token decode forwards**, including greedy
+token selection. CUDA work is synchronized before and at the end of capture,
+with no synchronization inserted between decode steps. CPU and CUDA activity
+and input shapes are recorded; compilation is not enabled.
+
+Each invocation writes `results/<timestamp>-<variant>-profile/`:
+
+```text
+config.json           settings for this run
+environment.json      checkpoint, device, software, quantization, and input hash
+measurements.jsonl    ordinary, unprofiled measurements
+summary.csv           throughput and prefill summary for the single workload
+profile/operators.txt CPU and GPU operator tables for the diagnostic capture
+profile/trace.json    execution timeline with eight decode_step regions
+```
+
+Start with `summary.csv` for latency and throughput. In `operators.txt`, compare
+the BF16 matrix operations with TorchAO's `_weight_int4pack_mm`, padding, and copy
+operations. The tables sort by self time to avoid counting a parent operator and
+its children twice. CPU time can include waiting in CUDA calls; CPU and GPU times
+overlap and should not be added together.
+
+Open `trace.json` in a Chrome-trace-compatible viewer such as
+[Perfetto](https://ui.perfetto.dev/), then inspect the `decode_step` regions and GPU
+lanes. Long-running GPU kernels suggest kernel cost; gaps between kernels need
+comparison with CPU activity before attributing them to dispatch overhead.
+Profiler and shape recording add overhead, so these traces diagnose execution
+rather than replace the ordinary benchmark. See the
+[PyTorch 2.9 profiler reference](https://docs.pytorch.org/docs/2.9/profiler.html).
+
+CUDA profiling needs working CUPTI support in the RunPod image. The command checks
+that CUDA activity was captured and reports an error if it only obtains CPU-side
+events. A baseline run with `--device cpu --dtype float32` can check the file
+workflow locally; its trace is explicitly labeled CPU-only. Profile folders omit
+`evaluation.json` and are separate from the full experiment comparisons.
+
 ## GPTQ with fixed group-128 scales
 
 ```bash
@@ -448,7 +501,7 @@ summary.csv           one row per workload case
 times generation; `results.py` writes plain files. `cli.py` connects those functions
 with a straightforward loop.
 
-Fifteen focused tests use generated tensors and randomly initialized Qwen
+Sixteen focused tests use generated tensors and randomly initialized Qwen
 models. Numerical examples check rounding, scales, and zero rows at both precisions.
 One group-128 numerical test covers multiple groups, rounding, and a zero group.
 One packing test checks known bytes and exact recovery of every emitted INT4 code.
@@ -467,6 +520,8 @@ One TorchAO storage test checks actual wrapper fields, padding, and shared views
 on CPU. One CUDA integration test uses a single Qwen block with the real projection
 widths, checks preserved layers and biases, and verifies packed dispatch during
 prefill and cached decode. This test is skipped when CUDA is unavailable.
+One CPU profiling test checks that the trace contains exactly eight decode steps,
+excludes prefill, and advances the KV cache correctly.
 Tests download no weights or data; their timings and perplexities are not
 model-quality or GPU-performance results.
 
